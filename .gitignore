@@ -203,6 +203,10 @@ cython_debug/
 # Temporary file for partial code execution
 tempCodeRunnerFile.py
 
+# Local shared files served by this project
+shared/
+.uploads/
+
 # Ruff stuff:
 .ruff_cache/
 

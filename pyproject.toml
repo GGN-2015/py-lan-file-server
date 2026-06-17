@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "py-lan-file-server"
+version = "0.1.0"
+description = "A small cross-platform LAN file upload/download server with resumable transfers."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+authors = [
+  { name = "GGN_2015" }
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Framework :: AsyncIO",
+  "Intended Audience :: End Users/Desktop",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
+  "Topic :: System :: Networking"
+]
+dependencies = []
+
+[project.scripts]
+lan-file-server = "lan_file_server.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["lan_file_server*"]
