@@ -4,7 +4,8 @@ A small cross-platform Python HTTP server for sharing one folder on a local netw
 
 ## Features
 
-- Clean browser UI with file search, drag-and-drop upload, size display, and modified timestamps.
+- Clean browser UI with folder browsing, file search, drag-and-drop file upload, size display, and modified timestamps.
+- Folder selection uploads every file recursively while preserving relative paths.
 - Live upload status over WebSocket, including uploads started by other clients.
 - Resumable downloads through standard HTTP `Range` requests.
 - Resumable browser uploads through chunked transfer.
@@ -34,6 +35,12 @@ python -m pip install .
 lan-file-server --dir ./shared --port 8000
 ```
 
+## Folders
+
+The shared directory may contain nested folders. The browser UI lets users open folders, go back to parent folders, and download files from any level.
+
+Use `Choose folder` to upload a local directory recursively. Each file is uploaded as its own resumable transfer and keeps its relative path under the selected folder.
+
 ## Upload Resume
 
 The web page splits files into chunks before uploading. If the browser tab is closed or the network drops, open the page again, select the same local file, and start the upload. The server continues from the bytes it already received.
@@ -42,7 +49,7 @@ Temporary upload data is stored in `.uploads` under the shared directory and is 
 
 ## Live Uploads And Cancellation
 
-Connected browser clients receive upload status through WebSocket. The upload panel shows active uploads from all clients and marks each row as either `This client` or `Other client`.
+Connected browser clients receive upload status through WebSocket. The upload panel shows active uploads from all clients and marks each row as either `This client` or `Other client`. Progress is shown per file, including files from recursive folder uploads.
 
 Only the browser client that started an upload can cancel it from the page. A manual cancellation aborts the local request and removes the server-side temporary upload file. If a connection drops unexpectedly, the active upload row is removed from connected pages and the incomplete in-flight chunk is rolled back; previously completed chunks remain available for resume.
 

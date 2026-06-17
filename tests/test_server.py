@@ -62,6 +62,23 @@ class ServerIntegrationTests(unittest.TestCase):
             self.assertEqual(response.headers["Accept-Ranges"], "bytes")
             self.assertEqual(response.read(), b"2345")
 
+    def test_file_list_supports_folders_and_nested_downloads(self) -> None:
+        nested = self.root / "docs"
+        nested.mkdir()
+        (nested / "readme.txt").write_bytes(b"hello-folder")
+
+        root_listing = self.get_files()
+        self.assertEqual(root_listing["folders"][0]["name"], "docs")
+        self.assertEqual(root_listing["folders"][0]["path"], "docs")
+
+        docs_listing = self.get_files("docs")
+        self.assertEqual(docs_listing["path"], "docs")
+        self.assertEqual(docs_listing["parent"], "")
+        self.assertEqual(docs_listing["files"][0]["path"], "docs/readme.txt")
+
+        with self.open("/files/docs/readme.txt") as response:
+            self.assertEqual(response.read(), b"hello-folder")
+
     def test_download_rejects_unsatisfiable_ranges(self) -> None:
         (self.root / "sample.bin").write_bytes(b"0123456789")
         request = urllib.request.Request(
@@ -75,27 +92,27 @@ class ServerIntegrationTests(unittest.TestCase):
         self.assertEqual(raised.exception.headers["Content-Range"], "bytes */10")
 
     def test_upload_chunks_are_resumable_and_replace_final_file(self) -> None:
-        self.put_upload_chunk("movie.bin", total=6, offset=0, body=b"abc")
-        self.assertFalse((self.root / "movie.bin").exists())
+        self.put_upload_chunk("clips/movie.bin", total=6, offset=0, body=b"abc")
+        self.assertFalse((self.root / "clips" / "movie.bin").exists())
 
-        status = self.get_upload_status("movie.bin", total=6)
+        status = self.get_upload_status("clips/movie.bin", total=6)
         self.assertIn("uploadId", status)
         self.assertEqual(status["offset"], 3)
         self.assertFalse(status["complete"])
 
         uploads = self.get_uploads()
         self.assertEqual(len(uploads), 1)
-        self.assertEqual(uploads[0]["name"], "movie.bin")
+        self.assertEqual(uploads[0]["name"], "clips/movie.bin")
         self.assertEqual(uploads[0]["offset"], 3)
 
-        final = self.put_upload_chunk("movie.bin", total=6, offset=3, body=b"def")
+        final = self.put_upload_chunk("clips/movie.bin", total=6, offset=3, body=b"def")
         self.assertTrue(final["complete"])
-        self.assertEqual((self.root / "movie.bin").read_bytes(), b"abcdef")
+        self.assertEqual((self.root / "clips" / "movie.bin").read_bytes(), b"abcdef")
         self.assertEqual(self.get_uploads(), [])
 
-        replaced = self.put_upload_chunk("movie.bin", total=3, offset=0, body=b"xyz", mtime="2")
+        replaced = self.put_upload_chunk("clips/movie.bin", total=3, offset=0, body=b"xyz", mtime="2")
         self.assertTrue(replaced["complete"])
-        self.assertEqual((self.root / "movie.bin").read_bytes(), b"xyz")
+        self.assertEqual((self.root / "clips" / "movie.bin").read_bytes(), b"xyz")
 
     def test_upload_cancel_removes_partial_file_and_active_status(self) -> None:
         self.put_upload_chunk("cancel.bin", total=6, offset=0, body=b"abc")
@@ -131,7 +148,7 @@ class ServerIntegrationTests(unittest.TestCase):
         mtime: str = "1",
         client: str = "test-client",
     ) -> dict:
-        params = urllib.parse.urlencode({"name": name, "size": str(total), "mtime": mtime, "client": client})
+        params = urllib.parse.urlencode({"path": name, "size": str(total), "mtime": mtime, "client": client})
         request = urllib.request.Request(
             self.base_url + "/api/upload?" + params,
             data=body,
@@ -142,8 +159,13 @@ class ServerIntegrationTests(unittest.TestCase):
             return json.loads(response.read().decode("utf-8"))
 
     def get_upload_status(self, name: str, total: int, mtime: str = "1", client: str = "test-client") -> dict:
-        params = urllib.parse.urlencode({"name": name, "size": str(total), "mtime": mtime, "client": client})
+        params = urllib.parse.urlencode({"path": name, "size": str(total), "mtime": mtime, "client": client})
         with self.open("/api/upload/status?" + params) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def get_files(self, path: str = "") -> dict:
+        params = urllib.parse.urlencode({"path": path})
+        with self.open("/api/files?" + params) as response:
             return json.loads(response.read().decode("utf-8"))
 
     def get_uploads(self) -> list[dict]:
@@ -151,7 +173,7 @@ class ServerIntegrationTests(unittest.TestCase):
             return json.loads(response.read().decode("utf-8"))["uploads"]
 
     def cancel_upload(self, name: str, total: int, mtime: str = "1", client: str = "test-client") -> dict:
-        params = urllib.parse.urlencode({"name": name, "size": str(total), "mtime": mtime, "client": client})
+        params = urllib.parse.urlencode({"path": name, "size": str(total), "mtime": mtime, "client": client})
         request = urllib.request.Request(
             self.base_url + "/api/upload/cancel?" + params,
             data=b"",
@@ -175,7 +197,7 @@ class ServerIntegrationTests(unittest.TestCase):
         sock.sendall(request.encode("ascii"))
         response = b""
         while b"\r\n\r\n" not in response:
-            response += sock.recv(1024)
+            response += sock.recv(1)
         self.assertIn(b" 101 ", response)
         return sock
 

@@ -137,6 +137,10 @@ PAGE_HTML = """<!doctype html>
       line-height: 1.25;
       letter-spacing: 0;
     }
+    #currentPath {
+      margin-top: 4px;
+      overflow-wrap: anywhere;
+    }
     .panel-head,
     .files-head {
       display: flex;
@@ -547,10 +551,15 @@ PAGE_HTML = """<!doctype html>
         </div>
         <div id="dropZone" class="drop-zone">
           <input id="fileInput" type="file" multiple>
+          <input id="folderInput" type="file" multiple webkitdirectory directory>
           <div class="actions">
             <label class="file-button" for="fileInput">
               <span aria-hidden="true">+</span>
               <span>Choose files</span>
+            </label>
+            <label class="file-button" for="folderInput">
+              <span aria-hidden="true">[]</span>
+              <span>Choose folder</span>
             </label>
             <button id="uploadBtn" class="primary" type="button" disabled>
               <span aria-hidden="true">^</span>
@@ -567,7 +576,10 @@ PAGE_HTML = """<!doctype html>
 
       <section class="files-shell" aria-labelledby="filesTitle">
         <div class="files-head">
-          <h2 id="filesTitle" class="files-title">Files</h2>
+          <div>
+            <h2 id="filesTitle" class="files-title">Files</h2>
+            <div id="currentPath" class="meta"></div>
+          </div>
           <div class="actions">
             <label class="search-wrap">
               <span aria-hidden="true">?</span>
@@ -586,6 +598,7 @@ PAGE_HTML = """<!doctype html>
   <script>
     const CHUNK_SIZE = Number("__UPLOAD_CHUNK_SIZE__");
     const fileInput = document.querySelector("#fileInput");
+    const folderInput = document.querySelector("#folderInput");
     const uploadBtn = document.querySelector("#uploadBtn");
     const clearBtn = document.querySelector("#clearBtn");
     const uploadList = document.querySelector("#uploadList");
@@ -600,8 +613,11 @@ PAGE_HTML = """<!doctype html>
     const fileCount = document.querySelector("#fileCount");
     const totalSize = document.querySelector("#totalSize");
     const latestTime = document.querySelector("#latestTime");
+    const currentPathLabel = document.querySelector("#currentPath");
     let selectedFiles = [];
     let allFiles = [];
+    let allFolders = [];
+    let currentPath = "";
     let activeUploadItems = [];
     let activeUploadRows = new Map();
     let currentRequests = new Map();
@@ -639,9 +655,17 @@ PAGE_HTML = """<!doctype html>
       return count === 1 ? singular : pluralForm;
     }
 
+    function fileUploadPath(file) {
+      return normalizeRelativePath(file.webkitRelativePath || file.relativePath || file.name);
+    }
+
+    function normalizeRelativePath(path) {
+      return String(path || "").replace(/\\\\/g, "/").replace(/^\\/+/, "");
+    }
+
     function uploadUrl(file) {
       const params = new URLSearchParams({
-        name: file.name,
+        path: fileUploadPath(file),
         size: String(file.size),
         mtime: String(file.lastModified || 0),
         client: clientId,
@@ -651,7 +675,7 @@ PAGE_HTML = """<!doctype html>
 
     function uploadStatusUrl(file) {
       const params = new URLSearchParams({
-        name: file.name,
+        path: fileUploadPath(file),
         size: String(file.size),
         mtime: String(file.lastModified || 0),
         client: clientId,
@@ -661,7 +685,7 @@ PAGE_HTML = """<!doctype html>
 
     function cancelUrl(upload) {
       const params = new URLSearchParams({
-        name: upload.name,
+        path: upload.path || upload.name,
         size: String(upload.size),
         mtime: String(upload.modified || 0),
         client: clientId,
@@ -693,7 +717,7 @@ PAGE_HTML = """<!doctype html>
           </div>
           <span class="meta">Ready</span>
         `;
-        item.querySelector(".file-name").textContent = file.name;
+        item.querySelector(".file-name").textContent = fileUploadPath(file);
         item.querySelector(".meta").textContent = formatBytes(file.size);
         selectionList.appendChild(item);
       }
@@ -750,7 +774,7 @@ PAGE_HTML = """<!doctype html>
             <button class="cancel-upload" type="button">Cancel</button>
           </div>
         `;
-        row.querySelector(".upload-name").textContent = upload.name;
+        row.querySelector(".upload-name").textContent = upload.path || upload.name;
         const percent = upload.size === 0 ? 100 : Math.floor((upload.offset / upload.size) * 100);
         row.querySelector(".progress-bar").style.width = `${percent}%`;
         row.querySelector(".upload-note").textContent = `${formatBytes(upload.offset)} / ${formatBytes(upload.size)}`;
@@ -788,7 +812,7 @@ PAGE_HTML = """<!doctype html>
         </div>
         <div class="upload-percent">0%</div>
       `;
-      row.querySelector(".upload-name").textContent = file.name;
+      row.querySelector(".upload-name").textContent = fileUploadPath(file);
       setUploadRow(row, file, 0, "Waiting");
       uploadList.prepend(row);
       return row;
@@ -807,12 +831,20 @@ PAGE_HTML = """<!doctype html>
 
     function renderFiles() {
       const keyword = fileSearch.value.trim().toLowerCase();
+      const folders = keyword
+        ? allFolders.filter((folder) => folder.name.toLowerCase().includes(keyword) || folder.path.toLowerCase().includes(keyword))
+        : allFolders;
       const files = keyword
-        ? allFiles.filter((file) => file.name.toLowerCase().includes(keyword))
+        ? allFiles.filter((file) => file.name.toLowerCase().includes(keyword) || file.path.toLowerCase().includes(keyword))
         : allFiles;
+      currentPathLabel.textContent = currentPath ? `/${currentPath}` : "/";
 
-      if (!files.length) {
-        filesSection.innerHTML = `<div class="empty">${allFiles.length ? "No matching files" : "No files yet"}</div>`;
+      if (!folders.length && !files.length && !currentPath) {
+        filesSection.innerHTML = `<div class="empty">${allFiles.length || allFolders.length ? "No matching items" : "No files yet"}</div>`;
+        return;
+      }
+      if (!folders.length && !files.length && currentPath) {
+        filesSection.innerHTML = `<div class="empty">This folder is empty</div>`;
         return;
       }
 
@@ -830,6 +862,47 @@ PAGE_HTML = """<!doctype html>
         </table>
       `;
       const tbody = filesSection.querySelector("tbody");
+      if (currentPath) {
+        const row = document.createElement("tr");
+        row.innerHTML = `
+          <td data-label="Name">
+            <div class="name-cell">
+              <span class="file-mark" aria-hidden="true">D</span>
+              <a class="file-link" href="#">..</a>
+            </div>
+          </td>
+          <td data-label="Size" class="size">Folder</td>
+          <td data-label="Modified"></td>
+          <td data-label="Download"></td>
+        `;
+        row.querySelector(".file-link").addEventListener("click", (event) => {
+          event.preventDefault();
+          loadFiles(parentPath(currentPath)).catch(showFileError);
+        });
+        tbody.appendChild(row);
+      }
+      for (const folder of folders) {
+        const row = document.createElement("tr");
+        row.innerHTML = `
+          <td data-label="Name">
+            <div class="name-cell">
+              <span class="file-mark" aria-hidden="true">D</span>
+              <a class="file-link" href="#"></a>
+            </div>
+          </td>
+          <td data-label="Size" class="size">Folder</td>
+          <td data-label="Modified"></td>
+          <td data-label="Download"></td>
+        `;
+        const folderLink = row.querySelector(".file-link");
+        folderLink.textContent = folder.name;
+        folderLink.addEventListener("click", (event) => {
+          event.preventDefault();
+          loadFiles(folder.path).catch(showFileError);
+        });
+        row.children[2].textContent = formatDate(folder.modified);
+        tbody.appendChild(row);
+      }
       for (const file of files) {
         const row = document.createElement("tr");
         const href = file.downloadUrl;
@@ -857,11 +930,24 @@ PAGE_HTML = """<!doctype html>
       }
     }
 
-    async function loadFiles() {
+    function parentPath(path) {
+      const parts = normalizeRelativePath(path).split("/").filter(Boolean);
+      parts.pop();
+      return parts.join("/");
+    }
+
+    function showFileError(error) {
+      summary.textContent = error.message || "File list failed";
+    }
+
+    async function loadFiles(path = currentPath) {
       summary.textContent = "Loading files...";
-      const response = await fetch("/api/files", { cache: "no-store" });
+      const params = new URLSearchParams({ path });
+      const response = await fetch(`/api/files?${params.toString()}`, { cache: "no-store" });
       if (!response.ok) throw new Error(`File list failed: ${response.status}`);
       const data = await response.json();
+      currentPath = data.path || "";
+      allFolders = (data.folders || []).sort((a, b) => a.name.localeCompare(b.name));
       allFiles = (data.files || []).sort((a, b) => b.modified - a.modified || a.name.localeCompare(b.name));
       renderStats(allFiles);
       renderFiles();
@@ -880,9 +966,7 @@ PAGE_HTML = """<!doctype html>
         if (message.type === "uploads") {
           renderActiveUploads(message.uploads || []);
         } else if (message.type === "filesChanged") {
-          loadFiles().catch((error) => {
-            summary.textContent = error.message || "File list failed";
-          });
+          loadFiles().catch(showFileError);
         }
       });
       socket.addEventListener("close", () => {
@@ -971,8 +1055,10 @@ PAGE_HTML = """<!doctype html>
     }
 
     fileInput.addEventListener("change", () => setSelectedFiles(fileInput.files));
+    folderInput.addEventListener("change", () => setSelectedFiles(folderInput.files));
     clearBtn.addEventListener("click", () => {
       fileInput.value = "";
+      folderInput.value = "";
       setSelectedFiles([]);
     });
     uploadBtn.addEventListener("click", uploadSelectedFiles);
@@ -1004,9 +1090,7 @@ PAGE_HTML = """<!doctype html>
     renderSelection();
     renderActiveUploads();
     connectWebSocket();
-    loadFiles().catch((error) => {
-      summary.textContent = error.message || "File list failed";
-    });
+    loadFiles().catch(showFileError);
   </script>
 </body>
 </html>

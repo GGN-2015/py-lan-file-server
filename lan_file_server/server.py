@@ -324,31 +324,64 @@ class LanFileRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def send_file_list(self) -> None:
+        parsed = urllib.parse.urlsplit(self.path)
+        try:
+            directory = query_path_value(parsed.query, default="")
+            directory_path = final_file_path(self.storage_root, directory) if directory else self.storage_root
+        except BadRequest as exc:
+            self.send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+
+        if not directory_path.is_dir():
+            self.send_json({"error": "Folder not found."}, status=HTTPStatus.NOT_FOUND)
+            return
+
+        folders = []
         files = []
-        for file_path in iter_visible_files(self.storage_root):
+        try:
+            entries = sorted(directory_path.iterdir(), key=lambda item: (not item.is_dir(), item.name.casefold()))
+        except OSError as exc:
+            self.send_json({"error": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        for entry in entries:
+            if directory == "" and entry.name == TEMP_DIR_NAME:
+                continue
             try:
-                stat = file_path.stat()
+                stat = entry.stat()
             except OSError:
                 continue
-            files.append(
-                {
-                    "name": file_path.name,
-                    "size": stat.st_size,
-                    "modified": int(stat.st_mtime),
-                    "downloadUrl": "/files/" + urllib.parse.quote(file_path.name),
-                }
-            )
-        self.send_json({"files": files})
+            relative = relative_display_path(entry.relative_to(self.storage_root))
+            if entry.is_dir():
+                folders.append(
+                    {
+                        "name": entry.name,
+                        "path": relative,
+                        "modified": int(stat.st_mtime),
+                    }
+                )
+            elif entry.is_file():
+                files.append(
+                    {
+                        "name": entry.name,
+                        "path": relative,
+                        "size": stat.st_size,
+                        "modified": int(stat.st_mtime),
+                        "downloadUrl": "/files/" + quote_path(relative),
+                    }
+                )
+        parent = parent_display_path(directory)
+        self.send_json({"path": directory, "parent": parent, "folders": folders, "files": files})
 
     def send_upload_list(self) -> None:
         self.send_json({"uploads": self.upload_registry.snapshot()})
 
     def send_upload_status(self, query: str) -> None:
         try:
-            name, total_size, modified, client_id = upload_request_values(query)
-            upload_id = upload_identifier(name, total_size, modified)
+            file_path, total_size, modified, client_id = upload_request_values(query)
+            upload_id = upload_identifier(file_path, total_size, modified)
             temp_path = upload_temp_path(self.storage_root, upload_id)
-            final_path = final_file_path(self.storage_root, name)
+            final_path = final_file_path(self.storage_root, file_path)
             with upload_lock(temp_path):
                 offset = temp_path.stat().st_size if temp_path.exists() else 0
                 if offset >= total_size and temp_path.exists():
@@ -367,7 +400,8 @@ class LanFileRequestHandler(BaseHTTPRequestHandler):
         self.send_json(
             {
                 "uploadId": upload_id,
-                "name": name,
+                "name": file_path,
+                "path": file_path,
                 "offset": offset,
                 "size": total_size,
                 "clientId": client_id,
@@ -377,12 +411,12 @@ class LanFileRequestHandler(BaseHTTPRequestHandler):
 
     def receive_upload_chunk(self, query: str) -> None:
         try:
-            name, total_size, modified, client_id = upload_request_values(query)
-            upload_id = upload_identifier(name, total_size, modified)
+            file_path, total_size, modified, client_id = upload_request_values(query)
+            upload_id = upload_identifier(file_path, total_size, modified)
             content_length = parse_content_length(self.headers.get("Content-Length"))
             client_offset = parse_non_negative_int(self.headers.get("Upload-Offset"), "Upload-Offset")
             temp_path = upload_temp_path(self.storage_root, upload_id)
-            final_path = final_file_path(self.storage_root, name)
+            final_path = final_file_path(self.storage_root, file_path)
         except BadRequest as exc:
             self.send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return
@@ -414,7 +448,7 @@ class LanFileRequestHandler(BaseHTTPRequestHandler):
                     self.send_json({"error": "Chunk exceeds declared upload size."}, status=HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
                     return
 
-                self.upload_registry.begin(upload_id, name, total_size, modified, client_id, server_offset)
+                self.upload_registry.begin(upload_id, file_path, total_size, modified, client_id, server_offset)
                 mode = "r+b" if temp_path.exists() else "wb"
                 with temp_path.open(mode) as target:
                     target.seek(server_offset)
@@ -425,6 +459,7 @@ class LanFileRequestHandler(BaseHTTPRequestHandler):
                 next_offset = server_offset + bytes_written
                 complete = next_offset == total_size
                 if complete:
+                    final_path.parent.mkdir(parents=True, exist_ok=True)
                     os.replace(temp_path, final_path)
                     self.upload_registry.finish(upload_id)
                     self.websocket_hub.broadcast_json({"type": "filesChanged"})
@@ -444,12 +479,12 @@ class LanFileRequestHandler(BaseHTTPRequestHandler):
             self.send_json({"error": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
             return
 
-        self.send_json({"uploadId": upload_id, "name": name, "offset": next_offset, "size": total_size, "complete": complete})
+        self.send_json({"uploadId": upload_id, "name": file_path, "path": file_path, "offset": next_offset, "size": total_size, "complete": complete})
 
     def cancel_upload(self, query: str) -> None:
         try:
-            name, total_size, modified, _client_id = upload_request_values(query)
-            upload_id = upload_identifier(name, total_size, modified)
+            file_path, total_size, modified, _client_id = upload_request_values(query)
+            upload_id = upload_identifier(file_path, total_size, modified)
             temp_path = upload_temp_path(self.storage_root, upload_id)
         except BadRequest as exc:
             self.send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
@@ -464,12 +499,12 @@ class LanFileRequestHandler(BaseHTTPRequestHandler):
             self.send_json({"error": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
             return
 
-        self.send_json({"uploadId": upload_id, "name": name, "cancelled": True})
+        self.send_json({"uploadId": upload_id, "name": file_path, "path": file_path, "cancelled": True})
 
     def send_download(self, encoded_name: str, send_body: bool) -> None:
         try:
-            name = decode_download_name(encoded_name)
-            file_path = final_file_path(self.storage_root, name)
+            display_path = decode_download_path(encoded_name)
+            file_path = final_file_path(self.storage_root, display_path)
         except BadRequest as exc:
             self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
             return
@@ -499,13 +534,13 @@ class LanFileRequestHandler(BaseHTTPRequestHandler):
             self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
             return
 
-        content_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        content_type = mimetypes.guess_type(display_path)[0] or "application/octet-stream"
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(content_length))
         self.send_header("Accept-Ranges", "bytes")
         self.send_header("Last-Modified", email.utils.formatdate(stat.st_mtime, usegmt=True))
-        self.send_header("Content-Disposition", content_disposition_header(name))
+        self.send_header("Content-Disposition", content_disposition_header(file_path.name))
         if status == HTTPStatus.PARTIAL_CONTENT:
             self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
         self.end_headers()
@@ -589,26 +624,23 @@ class LanFileRequestHandler(BaseHTTPRequestHandler):
             remaining -= len(chunk)
 
 
-def iter_visible_files(root: Path):
-    try:
-        entries = sorted(root.iterdir(), key=lambda item: item.name.casefold())
-    except OSError:
-        return
-
-    for entry in entries:
-        if entry.name == TEMP_DIR_NAME:
-            continue
-        if entry.is_file():
-            yield entry
-
-
 def upload_request_values(query: str) -> tuple[str, int, str, str]:
     params = urllib.parse.parse_qs(query, keep_blank_values=True)
-    raw_name = single_query_value(params, "name")
+    raw_path = single_query_value(params, "path", default="")
+    if not raw_path:
+        raw_path = single_query_value(params, "name")
     size = parse_non_negative_int(single_query_value(params, "size"), "size")
     modified = single_query_value(params, "mtime", default="0")
     client_id = sanitize_client_id(single_query_value(params, "client", default="unknown"))
-    return sanitize_upload_name(raw_name), size, modified, client_id
+    return sanitize_relative_path(raw_path), size, modified, client_id
+
+
+def query_path_value(query: str, default: str = "") -> str:
+    params = urllib.parse.parse_qs(query, keep_blank_values=True)
+    raw_path = single_query_value(params, "path", default=default)
+    if not raw_path:
+        return ""
+    return sanitize_relative_path(raw_path, allow_empty=True)
 
 
 def single_query_value(params: dict[str, list[str]], key: str, default: str | None = None) -> str:
@@ -638,35 +670,40 @@ def parse_non_negative_int(value: str | None, label: str) -> int:
     return number
 
 
-def sanitize_upload_name(raw_name: str) -> str:
-    name = raw_name.replace("\\", "/")
-    name = posixpath.basename(name)
-    name = name.replace("\x00", "")
-    name = "".join("_" if (char in WINDOWS_UNSAFE_CHARS or ord(char) < 32) else char for char in name)
-    name = name.strip()
-    name = name.rstrip(". ")
-    if name in {"", ".", ".."}:
-        raise BadRequest("Invalid file name.")
-    if name.casefold() == TEMP_DIR_NAME.casefold():
-        raise BadRequest("This file name is reserved.")
-    return name
+def sanitize_relative_path(raw_path: str, allow_empty: bool = False) -> str:
+    path = raw_path.replace("\\", "/").replace("\x00", "")
+    path = posixpath.normpath(path)
+    if path == ".":
+        path = ""
+    if path.startswith("/") or path.startswith("../") or path == "..":
+        raise BadRequest("Invalid path.")
+    if not path:
+        if allow_empty:
+            return ""
+        raise BadRequest("Invalid path.")
+
+    parts = []
+    for raw_part in path.split("/"):
+        part = raw_part.strip().rstrip(". ")
+        part = "".join("_" if (char in WINDOWS_UNSAFE_CHARS or ord(char) < 32) else char for char in part)
+        if part in {"", ".", ".."}:
+            raise BadRequest("Invalid path segment.")
+        if part.casefold() == TEMP_DIR_NAME.casefold():
+            raise BadRequest("This path is reserved.")
+        parts.append(part)
+    return "/".join(parts)
 
 
-def decode_download_name(encoded_name: str) -> str:
-    name = urllib.parse.unquote(encoded_name)
-    if not name or name in {".", ".."}:
-        raise BadRequest("Invalid file name.")
-    if "\x00" in name or "/" in name or "\\" in name:
-        raise BadRequest("Nested paths are not allowed.")
-    if name.casefold() == TEMP_DIR_NAME.casefold():
-        raise BadRequest("This file name is reserved.")
-    return name
+def decode_download_path(encoded_path: str) -> str:
+    return sanitize_relative_path(urllib.parse.unquote(encoded_path))
 
 
-def final_file_path(root: Path, name: str) -> Path:
-    path = (root / name).resolve()
-    if path.parent != root:
-        raise BadRequest("File must stay inside the shared directory.")
+def final_file_path(root: Path, relative_path: str) -> Path:
+    path = (root / Path(*relative_path.split("/"))).resolve()
+    try:
+        path.relative_to(root)
+    except ValueError as exc:
+        raise BadRequest("Path must stay inside the shared directory.") from exc
     return path
 
 
@@ -675,8 +712,23 @@ def sanitize_client_id(value: str) -> str:
     return cleaned[:80] or "unknown"
 
 
-def upload_identifier(name: str, total_size: int, modified: str) -> str:
-    return hashlib.sha256(f"{name}\0{total_size}\0{modified}".encode("utf-8")).hexdigest()
+def upload_identifier(relative_path: str, total_size: int, modified: str) -> str:
+    return hashlib.sha256(f"{relative_path}\0{total_size}\0{modified}".encode("utf-8")).hexdigest()
+
+
+def relative_display_path(path: Path) -> str:
+    return path.as_posix()
+
+
+def parent_display_path(relative_path: str) -> str | None:
+    if not relative_path:
+        return None
+    parent = posixpath.dirname(relative_path)
+    return parent or ""
+
+
+def quote_path(relative_path: str) -> str:
+    return urllib.parse.quote(relative_path, safe="/")
 
 
 def upload_temp_path(root: Path, upload_id: str) -> Path:
