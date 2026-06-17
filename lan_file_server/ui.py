@@ -411,6 +411,25 @@ PAGE_HTML = """<!doctype html>
       border-color: var(--accent-strong);
       text-decoration: none;
     }
+    .row-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .delete-button {
+      min-height: 34px;
+      padding: 6px 10px;
+      border-color: color-mix(in srgb, var(--danger) 40%, var(--line));
+      color: var(--danger);
+      font-weight: 650;
+    }
+    .delete-button:hover {
+      border-color: var(--danger);
+    }
+    .current-folder-link {
+      flex: 0 0 auto;
+    }
     .empty {
       display: grid;
       place-items: center;
@@ -468,6 +487,7 @@ PAGE_HTML = """<!doctype html>
       }
       .search-wrap,
       .actions button,
+      .actions .download-link,
       .file-button {
         width: 100%;
       }
@@ -585,6 +605,10 @@ PAGE_HTML = """<!doctype html>
               <span aria-hidden="true">?</span>
               <input id="fileSearch" class="search-input" type="search" placeholder="Search files" autocomplete="off">
             </label>
+            <a id="downloadFolderBtn" class="download-link current-folder-link" href="/folders/" download="shared.zip" title="Download current folder as ZIP">
+              <span aria-hidden="true">v</span>
+              <span>Folder ZIP</span>
+            </a>
             <button id="refreshBtn" class="icon" type="button" title="Refresh" aria-label="Refresh">
               <span aria-hidden="true">R</span>
             </button>
@@ -608,6 +632,7 @@ PAGE_HTML = """<!doctype html>
     const filesSection = document.querySelector("#files");
     const summary = document.querySelector("#summary");
     const refreshBtn = document.querySelector("#refreshBtn");
+    const downloadFolderBtn = document.querySelector("#downloadFolderBtn");
     const fileSearch = document.querySelector("#fileSearch");
     const dropZone = document.querySelector("#dropZone");
     const fileCount = document.querySelector("#fileCount");
@@ -620,6 +645,7 @@ PAGE_HTML = """<!doctype html>
     let currentPath = "";
     let activeUploadItems = [];
     let activeUploadRows = new Map();
+    let localUploadBatch = null;
     let currentRequests = new Map();
     let dragDepth = 0;
     const clientId = getClientId();
@@ -693,6 +719,25 @@ PAGE_HTML = """<!doctype html>
       return `/api/upload/cancel?${params.toString()}`;
     }
 
+    function itemDeleteUrl(path) {
+      const params = new URLSearchParams({ path });
+      return `/api/files?${params.toString()}`;
+    }
+
+    function folderZipName(path) {
+      const parts = normalizeRelativePath(path).split("/").filter(Boolean);
+      return `${parts.pop() || "shared"}.zip`;
+    }
+
+    function encodedRelativePath(path) {
+      return normalizeRelativePath(path).split("/").filter(Boolean).map(encodeURIComponent).join("/");
+    }
+
+    function folderDownloadUrl(path) {
+      const encoded = encodedRelativePath(path);
+      return encoded ? `/folders/${encoded}` : "/folders/";
+    }
+
     function setSelectedFiles(files) {
       selectedFiles = Array.from(files || []);
       renderSelection();
@@ -731,26 +776,104 @@ PAGE_HTML = """<!doctype html>
       }
     }
 
-    function setUploadRow(row, file, offset, note, state = "active") {
-      const percent = file.size === 0 ? 100 : Math.floor((offset / file.size) * 100);
-      row.classList.toggle("complete", state === "complete");
-      row.classList.toggle("failed", state === "failed");
+    function uploadPercent(offset, size) {
+      return size === 0 ? 100 : Math.min(100, Math.floor((offset / size) * 100));
+    }
+
+    function beginLocalUploadBatch(files) {
+      localUploadBatch = {
+        startedAt: Date.now() / 1000,
+        items: files.map((file) => ({
+          file,
+          offset: 0,
+          note: "Waiting",
+          state: "waiting",
+        })),
+      };
+      renderLocalUploadQueue();
+    }
+
+    function updateLocalUploadItem(index, offset, note, state = "active") {
+      if (!localUploadBatch || !localUploadBatch.items[index]) return;
+      const item = localUploadBatch.items[index];
+      item.offset = Math.min(offset, item.file.size);
+      item.note = note;
+      item.state = state;
+      renderLocalUploadQueue();
+    }
+
+    function renderLocalUploadQueue() {
+      uploadList.innerHTML = "";
+      if (!localUploadBatch) return;
+
+      const items = localUploadBatch.items;
+      const incomplete = items.filter((item) => item.state !== "complete" && uploadPercent(item.offset, item.file.size) < 100);
+      const leading = incomplete.slice().sort((a, b) => {
+        const percentB = uploadPercent(b.offset, b.file.size);
+        const percentA = uploadPercent(a.offset, a.file.size);
+        return percentB - percentA;
+      })[0];
+
+      if (leading) {
+        uploadList.appendChild(createLocalUploadRow(leading));
+      }
+
+      const completed = items.filter((item) => item.state === "complete").length;
+      const failed = items.filter((item) => item.state === "failed").length;
+      if (items.length > 1 || !leading) {
+        const folded = leading ? items.length - 1 : 0;
+        const item = document.createElement("div");
+        item.className = "selection-item";
+        item.innerHTML = `
+          <div>
+            <div class="file-name"></div>
+            <div class="meta"></div>
+          </div>
+          <span class="badge"></span>
+        `;
+        item.querySelector(".file-name").textContent = leading
+          ? `${folded} folded ${plural(folded, "file", "files")}`
+          : "Upload batch complete";
+        item.querySelector(".meta").textContent = `${formatElapsed(localUploadBatch.startedAt)} elapsed - ${items.length} total files, ${completed} uploaded${failed ? `, ${failed} failed` : ""}`;
+        item.querySelector(".badge").textContent = leading ? "Summary" : "Done";
+        uploadList.appendChild(item);
+      }
+    }
+
+    function createLocalUploadRow(item) {
+      const file = item.file;
+      const percent = uploadPercent(item.offset, file.size);
+      const row = document.createElement("div");
+      row.className = "upload-item";
+      row.classList.toggle("complete", item.state === "complete");
+      row.classList.toggle("failed", item.state === "failed");
+      row.innerHTML = `
+        <div>
+          <div class="upload-name"></div>
+          <div class="progress-track"><div class="progress-bar"></div></div>
+          <div class="upload-note"></div>
+        </div>
+        <div class="upload-percent"></div>
+      `;
+      row.querySelector(".upload-name").textContent = fileUploadPath(file);
       row.querySelector(".progress-bar").style.width = `${percent}%`;
       row.querySelector(".upload-percent").textContent = `${percent}%`;
-      row.querySelector(".upload-note").textContent = `${formatBytes(offset)} / ${formatBytes(file.size)} - ${note}`;
-      row.querySelector(".upload-note").className = state === "failed"
+      row.querySelector(".upload-note").textContent = `${formatBytes(item.offset)} / ${formatBytes(file.size)} - ${item.note}`;
+      row.querySelector(".upload-note").className = item.state === "failed"
         ? "upload-note status-error"
-        : state === "complete"
+        : item.state === "complete"
           ? "upload-note status-ok"
           : "upload-note";
+      return row;
     }
 
     function renderActiveUploads(uploads = activeUploadItems) {
       activeUploadItems = uploads;
       activeUploadRows = new Map();
       activeUploads.innerHTML = "";
+      const inProgressUploads = uploads.filter((upload) => upload.size === 0 ? upload.offset === 0 : uploadPercent(upload.offset, upload.size) < 100);
 
-      if (!uploads.length) {
+      if (!inProgressUploads.length) {
         const empty = document.createElement("div");
         empty.className = "selection-item";
         empty.innerHTML = `<div class="meta">No active uploads</div>`;
@@ -758,38 +881,76 @@ PAGE_HTML = """<!doctype html>
         return;
       }
 
-      for (const upload of uploads) {
-        const mine = upload.clientId === clientId;
-        const row = document.createElement("div");
-        row.className = mine ? "active-upload-item" : "active-upload-item other";
-        row.dataset.uploadId = upload.id;
-        row.innerHTML = `
+      const leading = inProgressUploads.slice().sort((a, b) => {
+        const percentA = uploadPercent(a.offset, a.size);
+        const percentB = uploadPercent(b.offset, b.size);
+        if (percentB !== percentA) return percentB - percentA;
+        return (b.updatedAt || 0) - (a.updatedAt || 0);
+      })[0];
+      const folded = inProgressUploads.filter((upload) => upload.id !== leading.id);
+
+      renderActiveUploadRow(leading);
+      if (folded.length) {
+        const startedAt = Math.min(...inProgressUploads.map((upload) => upload.startedAt || Date.now() / 1000));
+        const uploaded = uploads.filter((upload) => upload.size > 0 && uploadPercent(upload.offset, upload.size) >= 100).length;
+        const totalBytes = inProgressUploads.reduce((sum, upload) => sum + (upload.size || 0), 0);
+        const doneBytes = inProgressUploads.reduce((sum, upload) => sum + Math.min(upload.offset || 0, upload.size || 0), 0);
+        const summaryRow = document.createElement("div");
+        summaryRow.className = "selection-item";
+        summaryRow.innerHTML = `
           <div>
-            <div class="upload-name"></div>
-            <div class="progress-track"><div class="progress-bar"></div></div>
-            <div class="upload-note"></div>
+            <div class="file-name"></div>
+            <div class="meta"></div>
           </div>
-          <div class="actions">
-            <span class="badge"></span>
-            <button class="cancel-upload" type="button">Cancel</button>
-          </div>
+          <span class="badge"></span>
         `;
-        row.querySelector(".upload-name").textContent = upload.path || upload.name;
-        const percent = upload.size === 0 ? 100 : Math.floor((upload.offset / upload.size) * 100);
-        row.querySelector(".progress-bar").style.width = `${percent}%`;
-        row.querySelector(".upload-note").textContent = `${formatBytes(upload.offset)} / ${formatBytes(upload.size)}`;
-        const badge = row.querySelector(".badge");
-        badge.textContent = mine ? "This client" : "Other client";
-        badge.classList.toggle("other", !mine);
-        const cancel = row.querySelector(".cancel-upload");
-        cancel.disabled = !mine;
-        cancel.title = mine ? "Cancel this upload" : "Only the uploading client can cancel this";
-        if (mine) {
-          cancel.addEventListener("click", () => cancelUpload(upload));
-        }
-        activeUploads.appendChild(row);
-        activeUploadRows.set(upload.id, row);
+        summaryRow.querySelector(".file-name").textContent = `${folded.length} more active ${plural(folded.length, "upload", "uploads")}`;
+        summaryRow.querySelector(".meta").textContent = `${formatElapsed(startedAt)} elapsed - ${inProgressUploads.length} total files, ${uploaded} complete - ${formatBytes(doneBytes)} / ${formatBytes(totalBytes)}`;
+        summaryRow.querySelector(".badge").textContent = "Folded";
+        activeUploads.appendChild(summaryRow);
       }
+    }
+
+    function renderActiveUploadRow(upload) {
+      const mine = upload.clientId === clientId;
+      const row = document.createElement("div");
+      row.className = mine ? "active-upload-item" : "active-upload-item other";
+      row.dataset.uploadId = upload.id;
+      row.innerHTML = `
+        <div>
+          <div class="upload-name"></div>
+          <div class="progress-track"><div class="progress-bar"></div></div>
+          <div class="upload-note"></div>
+        </div>
+        <div class="actions">
+          <span class="badge"></span>
+          <button class="cancel-upload" type="button">Cancel</button>
+        </div>
+      `;
+      row.querySelector(".upload-name").textContent = upload.path || upload.name;
+      const percent = uploadPercent(upload.offset, upload.size);
+      row.querySelector(".progress-bar").style.width = `${percent}%`;
+      row.querySelector(".upload-note").textContent = `${formatBytes(upload.offset)} / ${formatBytes(upload.size)}`;
+      const badge = row.querySelector(".badge");
+      badge.textContent = mine ? "This client" : "Other client";
+      badge.classList.toggle("other", !mine);
+      const cancel = row.querySelector(".cancel-upload");
+      cancel.disabled = !mine;
+      cancel.title = mine ? "Cancel this upload" : "Only the uploading client can cancel this";
+      if (mine) {
+        cancel.addEventListener("click", () => cancelUpload(upload));
+      }
+      activeUploads.appendChild(row);
+      activeUploadRows.set(upload.id, row);
+    }
+
+    function formatElapsed(startedAt) {
+      if (!startedAt) return "0s";
+      const seconds = Math.max(0, Math.floor(Date.now() / 1000 - startedAt));
+      if (seconds < 60) return `${seconds}s`;
+      const minutes = Math.floor(seconds / 60);
+      if (minutes < 60) return `${minutes}m ${seconds % 60}s`;
+      return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
     }
 
     async function cancelUpload(upload) {
@@ -799,23 +960,6 @@ PAGE_HTML = """<!doctype html>
       }
       await fetch(cancelUrl(upload), { method: "POST" }).catch(() => {});
       await loadFiles().catch(() => {});
-    }
-
-    function createUploadRow(file) {
-      const row = document.createElement("div");
-      row.className = "upload-item";
-      row.innerHTML = `
-        <div>
-          <div class="upload-name"></div>
-          <div class="progress-track"><div class="progress-bar"></div></div>
-          <div class="upload-note"></div>
-        </div>
-        <div class="upload-percent">0%</div>
-      `;
-      row.querySelector(".upload-name").textContent = fileUploadPath(file);
-      setUploadRow(row, file, 0, "Waiting");
-      uploadList.prepend(row);
-      return row;
     }
 
     function renderStats(files) {
@@ -838,6 +982,8 @@ PAGE_HTML = """<!doctype html>
         ? allFiles.filter((file) => file.name.toLowerCase().includes(keyword) || file.path.toLowerCase().includes(keyword))
         : allFiles;
       currentPathLabel.textContent = currentPath ? `/${currentPath}` : "/";
+      downloadFolderBtn.href = folderDownloadUrl(currentPath);
+      downloadFolderBtn.download = folderZipName(currentPath);
 
       if (!folders.length && !files.length && !currentPath) {
         filesSection.innerHTML = `<div class="empty">${allFiles.length || allFolders.length ? "No matching items" : "No files yet"}</div>`;
@@ -855,7 +1001,7 @@ PAGE_HTML = """<!doctype html>
               <th>Name</th>
               <th>Size</th>
               <th>Modified</th>
-              <th>Download</th>
+              <th>Actions</th>
             </tr>
           </thead>
           <tbody></tbody>
@@ -873,7 +1019,7 @@ PAGE_HTML = """<!doctype html>
           </td>
           <td data-label="Size" class="size">Folder</td>
           <td data-label="Modified"></td>
-          <td data-label="Download"></td>
+          <td data-label="Actions"></td>
         `;
         row.querySelector(".file-link").addEventListener("click", (event) => {
           event.preventDefault();
@@ -892,7 +1038,12 @@ PAGE_HTML = """<!doctype html>
           </td>
           <td data-label="Size" class="size">Folder</td>
           <td data-label="Modified"></td>
-          <td data-label="Download"></td>
+          <td data-label="Actions">
+            <div class="row-actions">
+              <a class="download-link"><span aria-hidden="true">v</span><span>ZIP</span></a>
+              <button class="delete-button" type="button">Delete</button>
+            </div>
+          </td>
         `;
         const folderLink = row.querySelector(".file-link");
         folderLink.textContent = folder.name;
@@ -901,6 +1052,10 @@ PAGE_HTML = """<!doctype html>
           loadFiles(folder.path).catch(showFileError);
         });
         row.children[2].textContent = formatDate(folder.modified);
+        const downloadLink = row.querySelector(".download-link");
+        downloadLink.href = folder.downloadUrl || folderDownloadUrl(folder.path);
+        downloadLink.download = folderZipName(folder.path);
+        row.querySelector(".delete-button").addEventListener("click", () => deleteItem(folder.path, folder.name, "folder"));
         tbody.appendChild(row);
       }
       for (const file of files) {
@@ -915,7 +1070,12 @@ PAGE_HTML = """<!doctype html>
           </td>
           <td data-label="Size" class="size"></td>
           <td data-label="Modified"></td>
-          <td data-label="Download"><a class="download-link"><span aria-hidden="true">v</span><span>Download</span></a></td>
+          <td data-label="Actions">
+            <div class="row-actions">
+              <a class="download-link"><span aria-hidden="true">v</span><span>Download</span></a>
+              <button class="delete-button" type="button">Delete</button>
+            </div>
+          </td>
         `;
         const nameLink = row.querySelector(".file-link");
         nameLink.href = href;
@@ -926,8 +1086,21 @@ PAGE_HTML = """<!doctype html>
         const downloadLink = row.querySelector(".download-link");
         downloadLink.href = href;
         downloadLink.download = file.name;
+        row.querySelector(".delete-button").addEventListener("click", () => deleteItem(file.path, file.name, "file"));
         tbody.appendChild(row);
       }
+    }
+
+    async function deleteItem(path, name, type) {
+      const confirmed = window.confirm(`Delete ${type} "${name}"?`);
+      if (!confirmed) return;
+      const response = await fetch(itemDeleteUrl(path), { method: "DELETE" });
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        summary.textContent = data.error || `Delete failed: ${response.status}`;
+        return;
+      }
+      await loadFiles().catch(showFileError);
     }
 
     function parentPath(path) {
@@ -974,8 +1147,7 @@ PAGE_HTML = """<!doctype html>
       });
     }
 
-    async function uploadFile(file) {
-      const row = createUploadRow(file);
+    async function uploadFile(file, index) {
       let offset = 0;
       let uploadId = "";
       try {
@@ -984,7 +1156,7 @@ PAGE_HTML = """<!doctype html>
         const status = await statusResponse.json();
         uploadId = status.uploadId || "";
         offset = Math.min(status.offset || 0, file.size);
-        setUploadRow(row, file, offset, offset ? "Resuming" : "Starting");
+        updateLocalUploadItem(index, offset, offset ? "Resuming" : "Starting");
 
         if (file.size === 0) {
           const controller = new AbortController();
@@ -997,7 +1169,7 @@ PAGE_HTML = """<!doctype html>
           });
           if (uploadId) currentRequests.delete(uploadId);
           if (!response.ok) throw new Error(await response.text());
-          setUploadRow(row, file, 0, "Complete", "complete");
+          updateLocalUploadItem(index, 0, "Complete", "complete");
           return;
         }
 
@@ -1017,7 +1189,7 @@ PAGE_HTML = """<!doctype html>
 
           if (response.status === 409 && typeof data.offset === "number") {
             offset = Math.min(data.offset, file.size);
-            setUploadRow(row, file, offset, "Syncing offset");
+            updateLocalUploadItem(index, offset, "Syncing offset");
             continue;
           }
           if (!response.ok) {
@@ -1026,11 +1198,11 @@ PAGE_HTML = """<!doctype html>
 
           offset = data.offset;
           uploadId = data.uploadId || uploadId;
-          setUploadRow(row, file, offset, data.complete ? "Complete" : "Uploading", data.complete ? "complete" : "active");
+          updateLocalUploadItem(index, offset, data.complete ? "Complete" : "Uploading", data.complete ? "complete" : "active");
         }
       } catch (error) {
         const message = error.name === "AbortError" ? "Cancelled" : (error.message || "Upload failed");
-        setUploadRow(row, file, offset, message, "failed");
+        updateLocalUploadItem(index, offset, message, "failed");
       } finally {
         if (uploadId) currentRequests.delete(uploadId);
       }
@@ -1041,9 +1213,10 @@ PAGE_HTML = """<!doctype html>
       uploadBtn.disabled = true;
       clearBtn.disabled = true;
       const files = selectedFiles.slice();
+      beginLocalUploadBatch(files);
       try {
-        for (const file of files) {
-          await uploadFile(file);
+        for (const [index, file] of files.entries()) {
+          await uploadFile(file, index);
         }
         fileInput.value = "";
         setSelectedFiles([]);

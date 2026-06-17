@@ -8,11 +8,14 @@ import mimetypes
 import os
 import posixpath
 import re
+import shutil
 import socket
 import struct
+import tempfile
 import threading
 import time
 import urllib.parse
+import zipfile
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -284,6 +287,9 @@ class LanFileRequestHandler(BaseHTTPRequestHandler):
             self.send_upload_status(parsed.query)
         elif parsed.path == "/ws":
             self.handle_websocket(parsed.query)
+        elif parsed.path == "/folders" or parsed.path.startswith("/folders/"):
+            encoded_path = "" if parsed.path == "/folders" else parsed.path.removeprefix("/folders/")
+            self.send_folder_download(encoded_path, send_body=True)
         elif parsed.path.startswith("/files/"):
             self.send_download(parsed.path.removeprefix("/files/"), send_body=True)
         else:
@@ -291,7 +297,10 @@ class LanFileRequestHandler(BaseHTTPRequestHandler):
 
     def do_HEAD(self) -> None:
         parsed = urllib.parse.urlsplit(self.path)
-        if parsed.path.startswith("/files/"):
+        if parsed.path == "/folders" or parsed.path.startswith("/folders/"):
+            encoded_path = "" if parsed.path == "/folders" else parsed.path.removeprefix("/folders/")
+            self.send_folder_download(encoded_path, send_body=False)
+        elif parsed.path.startswith("/files/"):
             self.send_download(parsed.path.removeprefix("/files/"), send_body=False)
         else:
             self.send_error(HTTPStatus.NOT_FOUND, "Not found")
@@ -300,6 +309,13 @@ class LanFileRequestHandler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlsplit(self.path)
         if parsed.path == "/api/upload":
             self.receive_upload_chunk(parsed.query)
+        else:
+            self.send_error(HTTPStatus.NOT_FOUND, "Not found")
+
+    def do_DELETE(self) -> None:
+        parsed = urllib.parse.urlsplit(self.path)
+        if parsed.path == "/api/files":
+            self.delete_file_or_folder(parsed.query)
         else:
             self.send_error(HTTPStatus.NOT_FOUND, "Not found")
 
@@ -358,6 +374,7 @@ class LanFileRequestHandler(BaseHTTPRequestHandler):
                         "name": entry.name,
                         "path": relative,
                         "modified": int(stat.st_mtime),
+                        "downloadUrl": "/folders/" + quote_path(relative),
                     }
                 )
             elif entry.is_file():
@@ -371,7 +388,16 @@ class LanFileRequestHandler(BaseHTTPRequestHandler):
                     }
                 )
         parent = parent_display_path(directory)
-        self.send_json({"path": directory, "parent": parent, "folders": folders, "files": files})
+        current_download_url = "/folders/" + quote_path(directory) if directory else "/folders/"
+        self.send_json(
+            {
+                "path": directory,
+                "parent": parent,
+                "downloadUrl": current_download_url,
+                "folders": folders,
+                "files": files,
+            }
+        )
 
     def send_upload_list(self) -> None:
         self.send_json({"uploads": self.upload_registry.snapshot()})
@@ -501,6 +527,31 @@ class LanFileRequestHandler(BaseHTTPRequestHandler):
 
         self.send_json({"uploadId": upload_id, "name": file_path, "path": file_path, "cancelled": True})
 
+    def delete_file_or_folder(self, query: str) -> None:
+        try:
+            display_path = query_required_path_value(query)
+            target_path = deletable_file_path(self.storage_root, display_path)
+        except BadRequest as exc:
+            self.send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+
+        try:
+            if target_path.is_symlink() or target_path.is_file():
+                target_path.unlink()
+                item_type = "file"
+            elif target_path.is_dir():
+                shutil.rmtree(target_path)
+                item_type = "folder"
+            else:
+                self.send_json({"error": "File or folder not found."}, status=HTTPStatus.NOT_FOUND)
+                return
+        except OSError as exc:
+            self.send_json({"error": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        self.websocket_hub.broadcast_json({"type": "filesChanged"})
+        self.send_json({"path": display_path, "type": item_type, "deleted": True})
+
     def send_download(self, encoded_name: str, send_body: bool) -> None:
         try:
             display_path = decode_download_path(encoded_name)
@@ -552,6 +603,61 @@ class LanFileRequestHandler(BaseHTTPRequestHandler):
                     copy_limited(source, self.wfile, content_length)
             except (BrokenPipeError, ConnectionResetError):
                 return
+
+    def send_folder_download(self, encoded_path: str, send_body: bool) -> None:
+        try:
+            display_path = decode_folder_path(encoded_path)
+            folder_path = self.storage_root if not display_path else final_file_path(self.storage_root, display_path)
+        except BadRequest as exc:
+            self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+
+        if not folder_path.is_dir():
+            self.send_error(HTTPStatus.NOT_FOUND, "Folder not found")
+            return
+
+        archive_name = folder_archive_name(display_path)
+        archive_root = archive_name[:-4]
+        size = 0
+        try:
+            folder_stat = folder_path.stat()
+            with tempfile.TemporaryFile() as archive:
+                latest_mtime = folder_stat.st_mtime
+                with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as zip_file:
+                    latest_mtime = max(latest_mtime, write_folder_zip(zip_file, folder_path, archive_root))
+
+                size = archive.tell()
+                range_header = self.headers.get("Range")
+                if range_header:
+                    start, end = parse_http_range(range_header, size)
+                    status = HTTPStatus.PARTIAL_CONTENT
+                else:
+                    start, end = 0, max(0, size - 1)
+                    status = HTTPStatus.OK
+                content_length = 0 if size == 0 else end - start + 1
+
+                self.send_response(status)
+                self.send_header("Content-Type", "application/zip")
+                self.send_header("Content-Length", str(content_length))
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Last-Modified", email.utils.formatdate(latest_mtime, usegmt=True))
+                self.send_header("Content-Disposition", content_disposition_header(archive_name))
+                if status == HTTPStatus.PARTIAL_CONTENT:
+                    self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+                self.end_headers()
+
+                if send_body and content_length:
+                    archive.seek(start)
+                    copy_limited(archive, self.wfile, content_length)
+        except RangeNotSatisfiable:
+            self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+            self.send_header("Content-Range", f"bytes */{size}")
+            self.send_header("Accept-Ranges", "bytes")
+            self.end_headers()
+        except (BrokenPipeError, ConnectionResetError):
+            return
+        except (OSError, zipfile.BadZipFile) as exc:
+            self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
 
     def send_json(self, value: dict[str, Any], status: HTTPStatus = HTTPStatus.OK) -> None:
         body = json.dumps(value, ensure_ascii=False).encode("utf-8")
@@ -643,6 +749,11 @@ def query_path_value(query: str, default: str = "") -> str:
     return sanitize_relative_path(raw_path, allow_empty=True)
 
 
+def query_required_path_value(query: str) -> str:
+    params = urllib.parse.parse_qs(query, keep_blank_values=True)
+    return sanitize_relative_path(single_query_value(params, "path"))
+
+
 def single_query_value(params: dict[str, list[str]], key: str, default: str | None = None) -> str:
     values = params.get(key)
     if not values:
@@ -698,6 +809,10 @@ def decode_download_path(encoded_path: str) -> str:
     return sanitize_relative_path(urllib.parse.unquote(encoded_path))
 
 
+def decode_folder_path(encoded_path: str) -> str:
+    return sanitize_relative_path(urllib.parse.unquote(encoded_path), allow_empty=True)
+
+
 def final_file_path(root: Path, relative_path: str) -> Path:
     path = (root / Path(*relative_path.split("/"))).resolve()
     try:
@@ -705,6 +820,17 @@ def final_file_path(root: Path, relative_path: str) -> Path:
     except ValueError as exc:
         raise BadRequest("Path must stay inside the shared directory.") from exc
     return path
+
+
+def deletable_file_path(root: Path, relative_path: str) -> Path:
+    raw_path = root / Path(*relative_path.split("/"))
+    try:
+        raw_path.parent.resolve().relative_to(root)
+    except ValueError as exc:
+        raise BadRequest("Path must stay inside the shared directory.") from exc
+    if raw_path.is_symlink():
+        return raw_path
+    return final_file_path(root, relative_path)
 
 
 def sanitize_client_id(value: str) -> str:
@@ -729,6 +855,66 @@ def parent_display_path(relative_path: str) -> str | None:
 
 def quote_path(relative_path: str) -> str:
     return urllib.parse.quote(relative_path, safe="/")
+
+
+def folder_archive_name(relative_path: str) -> str:
+    if not relative_path:
+        return "shared.zip"
+    name = posixpath.basename(relative_path.rstrip("/")) or "folder"
+    return f"{name}.zip"
+
+
+def write_folder_zip(zip_file: zipfile.ZipFile, folder_path: Path, archive_root: str) -> float:
+    latest_mtime = folder_path.stat().st_mtime
+    wrote_entry = False
+    for current_root, dir_names, file_names in os.walk(folder_path):
+        current_path = Path(current_root)
+        try:
+            current_stat = current_path.stat()
+            latest_mtime = max(latest_mtime, current_stat.st_mtime)
+        except OSError:
+            current_stat = None
+        dir_names[:] = [
+            name
+            for name in sorted(dir_names, key=str.casefold)
+            if not (current_path == folder_path and name.casefold() == TEMP_DIR_NAME.casefold())
+            and not (current_path / name).is_symlink()
+        ]
+        sorted_files = sorted(file_names, key=str.casefold)
+        rel_dir = current_path.relative_to(folder_path).as_posix()
+        archive_dir = archive_root if rel_dir == "." else posixpath.join(archive_root, rel_dir)
+        visible_entries = [*dir_names, *sorted_files]
+        if not visible_entries:
+            zip_file.writestr(directory_zip_info(archive_dir, current_stat), b"")
+            wrote_entry = True
+        for file_name in sorted_files:
+            file_path = current_path / file_name
+            if file_path.is_symlink() or not file_path.is_file():
+                continue
+            try:
+                stat = file_path.stat()
+            except OSError:
+                continue
+            latest_mtime = max(latest_mtime, stat.st_mtime)
+            zip_file.write(file_path, posixpath.join(archive_dir, file_name))
+            wrote_entry = True
+    if not wrote_entry:
+        zip_file.writestr(directory_zip_info(archive_root, folder_path.stat()), b"")
+    return latest_mtime
+
+
+def directory_zip_info(archive_dir: str, stat_result) -> zipfile.ZipInfo:
+    modified = stat_result.st_mtime if stat_result else 0
+    info = zipfile.ZipInfo(archive_dir.rstrip("/") + "/", date_time=zip_datetime(modified))
+    info.external_attr = 0o40755 << 16
+    return info
+
+
+def zip_datetime(timestamp: float) -> tuple[int, int, int, int, int, int]:
+    date_time = time.localtime(timestamp)[:6]
+    if date_time[0] < 1980:
+        return (1980, 1, 1, 0, 0, 0)
+    return date_time
 
 
 def upload_temp_path(root: Path, upload_id: str) -> Path:

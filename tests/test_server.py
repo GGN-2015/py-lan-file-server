@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import io
 import os
 import json
 import socket
@@ -11,6 +12,7 @@ import unittest
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 from pathlib import Path
 
 from lan_file_server.server import RangeNotSatisfiable, create_server, parse_http_range
@@ -70,14 +72,86 @@ class ServerIntegrationTests(unittest.TestCase):
         root_listing = self.get_files()
         self.assertEqual(root_listing["folders"][0]["name"], "docs")
         self.assertEqual(root_listing["folders"][0]["path"], "docs")
+        self.assertEqual(root_listing["folders"][0]["downloadUrl"], "/folders/docs")
 
         docs_listing = self.get_files("docs")
         self.assertEqual(docs_listing["path"], "docs")
         self.assertEqual(docs_listing["parent"], "")
+        self.assertEqual(docs_listing["downloadUrl"], "/folders/docs")
         self.assertEqual(docs_listing["files"][0]["path"], "docs/readme.txt")
 
         with self.open("/files/docs/readme.txt") as response:
             self.assertEqual(response.read(), b"hello-folder")
+
+    def test_folder_download_returns_recursive_zip(self) -> None:
+        docs = self.root / "docs"
+        (docs / "nested").mkdir(parents=True)
+        (docs / "empty").mkdir()
+        (docs / "readme.txt").write_bytes(b"hello-folder")
+        (docs / "nested" / "guide.txt").write_bytes(b"nested-guide")
+
+        with self.open("/folders/docs") as response:
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.headers["Content-Type"], "application/zip")
+            self.assertEqual(response.headers["Accept-Ranges"], "bytes")
+            archive_data = response.read()
+
+        with zipfile.ZipFile(io.BytesIO(archive_data)) as archive:
+            self.assertEqual(archive.read("docs/readme.txt"), b"hello-folder")
+            self.assertEqual(archive.read("docs/nested/guide.txt"), b"nested-guide")
+            self.assertIn("docs/empty/", archive.namelist())
+
+    def test_root_folder_download_skips_upload_temp_directory(self) -> None:
+        (self.root / "visible.txt").write_bytes(b"visible")
+        (self.root / ".uploads" / "hidden.part").write_bytes(b"hidden")
+
+        with self.open("/folders/") as response:
+            archive_data = response.read()
+
+        with zipfile.ZipFile(io.BytesIO(archive_data)) as archive:
+            self.assertEqual(archive.read("shared/visible.txt"), b"visible")
+            self.assertNotIn("shared/.uploads/hidden.part", archive.namelist())
+
+    def test_folder_download_supports_range_requests(self) -> None:
+        docs = self.root / "docs"
+        docs.mkdir()
+        (docs / "readme.txt").write_bytes(b"hello-folder")
+        with self.open("/folders/docs") as response:
+            archive_data = response.read()
+
+        request = urllib.request.Request(
+            self.base_url + "/folders/docs",
+            headers={"Range": "bytes=0-9"},
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 206)
+            self.assertEqual(response.headers["Content-Range"], f"bytes 0-9/{len(archive_data)}")
+            self.assertEqual(response.read(), archive_data[:10])
+
+    def test_delete_file_and_folder(self) -> None:
+        (self.root / "delete-me.txt").write_bytes(b"gone")
+        folder = self.root / "folder"
+        (folder / "nested").mkdir(parents=True)
+        (folder / "nested" / "file.txt").write_bytes(b"gone-too")
+
+        file_result = self.delete_item("delete-me.txt")
+        self.assertTrue(file_result["deleted"])
+        self.assertEqual(file_result["type"], "file")
+        self.assertFalse((self.root / "delete-me.txt").exists())
+
+        folder_result = self.delete_item("folder")
+        self.assertTrue(folder_result["deleted"])
+        self.assertEqual(folder_result["type"], "folder")
+        self.assertFalse(folder.exists())
+
+    def test_delete_rejects_root_and_reserved_paths(self) -> None:
+        with self.assertRaises(urllib.error.HTTPError) as missing_path:
+            self.delete_item("")
+        self.assertEqual(missing_path.exception.code, 400)
+
+        with self.assertRaises(urllib.error.HTTPError) as reserved_path:
+            self.delete_item(".uploads/temp.part")
+        self.assertEqual(reserved_path.exception.code, 400)
 
     def test_download_rejects_unsatisfiable_ranges(self) -> None:
         (self.root / "sample.bin").write_bytes(b"0123456789")
@@ -178,6 +252,16 @@ class ServerIntegrationTests(unittest.TestCase):
             self.base_url + "/api/upload/cancel?" + params,
             data=b"",
             method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def delete_item(self, path: str) -> dict:
+        params = urllib.parse.urlencode({"path": path})
+        request = urllib.request.Request(
+            self.base_url + "/api/files?" + params,
+            data=None,
+            method="DELETE",
         )
         with urllib.request.urlopen(request, timeout=5) as response:
             return json.loads(response.read().decode("utf-8"))
