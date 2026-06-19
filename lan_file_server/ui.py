@@ -430,6 +430,23 @@ PAGE_HTML = """<!doctype html>
     .current-folder-link {
       flex: 0 0 auto;
     }
+    .pagination {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 12px 14px;
+      border-top: 1px solid var(--line);
+      background: var(--surface);
+    }
+    .pagination .actions {
+      flex-wrap: nowrap;
+    }
+    .page-status {
+      color: var(--muted);
+      font-size: 13px;
+      overflow-wrap: anywhere;
+    }
     .empty {
       display: grid;
       place-items: center;
@@ -481,6 +498,7 @@ PAGE_HTML = """<!doctype html>
       }
       .panel-head,
       .files-head,
+      .pagination,
       .drop-zone .actions {
         align-items: stretch;
         flex-direction: column;
@@ -643,6 +661,9 @@ PAGE_HTML = """<!doctype html>
     let allFiles = [];
     let allFolders = [];
     let currentPath = "";
+    let currentPage = 1;
+    let currentPagination = { page: 1, perPage: 10, totalItems: 0, totalPages: 1 };
+    let currentStats = { fileCount: 0, folderCount: 0, totalSize: 0, latestModified: 0 };
     let activeUploadItems = [];
     let activeUploadRows = new Map();
     let localUploadBatch = null;
@@ -962,35 +983,35 @@ PAGE_HTML = """<!doctype html>
       await loadFiles().catch(() => {});
     }
 
-    function renderStats(files) {
-      const totalBytes = files.reduce((sum, file) => sum + file.size, 0);
-      const latest = files.reduce((value, file) => Math.max(value, file.modified || 0), 0);
-      fileCount.textContent = String(files.length);
-      totalSize.textContent = formatBytes(totalBytes);
-      latestTime.textContent = formatShortDate(latest);
-      summary.textContent = files.length
-        ? `${files.length} ${plural(files.length, "file", "files")} / ${formatBytes(totalBytes)}`
+    function renderStats(stats, pagination) {
+      const totalFiles = stats.fileCount || 0;
+      const totalFolders = stats.folderCount || 0;
+      fileCount.textContent = String(totalFiles);
+      totalSize.textContent = formatBytes(stats.totalSize || 0);
+      latestTime.textContent = formatShortDate(stats.latestModified || 0);
+      summary.textContent = totalFiles || totalFolders
+        ? `${totalFiles} ${plural(totalFiles, "file", "files")} / ${totalFolders} ${plural(totalFolders, "folder", "folders")} / ${formatBytes(stats.totalSize || 0)}`
         : "No files yet";
+      if (pagination && pagination.totalItems && fileSearch.value.trim()) {
+        summary.textContent += ` - ${pagination.totalItems} matching ${plural(pagination.totalItems, "item", "items")}`;
+      }
     }
 
     function renderFiles() {
-      const keyword = fileSearch.value.trim().toLowerCase();
-      const folders = keyword
-        ? allFolders.filter((folder) => folder.name.toLowerCase().includes(keyword) || folder.path.toLowerCase().includes(keyword))
-        : allFolders;
-      const files = keyword
-        ? allFiles.filter((file) => file.name.toLowerCase().includes(keyword) || file.path.toLowerCase().includes(keyword))
-        : allFiles;
+      const folders = allFolders;
+      const files = allFiles;
       currentPathLabel.textContent = currentPath ? `/${currentPath}` : "/";
       downloadFolderBtn.href = folderDownloadUrl(currentPath);
       downloadFolderBtn.download = folderZipName(currentPath);
 
       if (!folders.length && !files.length && !currentPath) {
-        filesSection.innerHTML = `<div class="empty">${allFiles.length || allFolders.length ? "No matching items" : "No files yet"}</div>`;
+        filesSection.innerHTML = `<div class="empty">${currentStats.fileCount || currentStats.folderCount ? "No matching items" : "No files yet"}</div>${paginationMarkup()}`;
+        bindPaginationControls();
         return;
       }
       if (!folders.length && !files.length && currentPath) {
-        filesSection.innerHTML = `<div class="empty">This folder is empty</div>`;
+        filesSection.innerHTML = `<div class="empty">${currentStats.fileCount || currentStats.folderCount ? "No matching items" : "This folder is empty"}</div>${paginationMarkup()}`;
+        bindPaginationControls();
         return;
       }
 
@@ -1006,6 +1027,7 @@ PAGE_HTML = """<!doctype html>
           </thead>
           <tbody></tbody>
         </table>
+        ${paginationMarkup()}
       `;
       const tbody = filesSection.querySelector("tbody");
       if (currentPath) {
@@ -1023,7 +1045,7 @@ PAGE_HTML = """<!doctype html>
         `;
         row.querySelector(".file-link").addEventListener("click", (event) => {
           event.preventDefault();
-          loadFiles(parentPath(currentPath)).catch(showFileError);
+          loadFiles(parentPath(currentPath), 1).catch(showFileError);
         });
         tbody.appendChild(row);
       }
@@ -1049,7 +1071,7 @@ PAGE_HTML = """<!doctype html>
         folderLink.textContent = folder.name;
         folderLink.addEventListener("click", (event) => {
           event.preventDefault();
-          loadFiles(folder.path).catch(showFileError);
+          loadFiles(folder.path, 1).catch(showFileError);
         });
         row.children[2].textContent = formatDate(folder.modified);
         const downloadLink = row.querySelector(".download-link");
@@ -1089,6 +1111,35 @@ PAGE_HTML = """<!doctype html>
         row.querySelector(".delete-button").addEventListener("click", () => deleteItem(file.path, file.name, "file"));
         tbody.appendChild(row);
       }
+      bindPaginationControls();
+    }
+
+    function paginationMarkup() {
+      const totalPages = currentPagination.totalPages || 1;
+      const page = currentPagination.page || 1;
+      const totalItems = currentPagination.totalItems || 0;
+      const from = totalItems ? (page - 1) * currentPagination.perPage + 1 : 0;
+      const to = totalItems ? Math.min(page * currentPagination.perPage, totalItems) : 0;
+      return `
+        <div class="pagination">
+          <div class="page-status">${totalItems ? `${from}-${to} of ${totalItems} items` : "0 items"} - Page ${page} of ${totalPages}</div>
+          <div class="actions">
+            <button id="prevPageBtn" type="button" ${page <= 1 ? "disabled" : ""}>Previous</button>
+            <button id="nextPageBtn" type="button" ${page >= totalPages ? "disabled" : ""}>Next</button>
+          </div>
+        </div>
+      `;
+    }
+
+    function bindPaginationControls() {
+      const previous = document.querySelector("#prevPageBtn");
+      const next = document.querySelector("#nextPageBtn");
+      if (previous) {
+        previous.addEventListener("click", () => loadFiles(currentPath, currentPage - 1).catch(showFileError));
+      }
+      if (next) {
+        next.addEventListener("click", () => loadFiles(currentPath, currentPage + 1).catch(showFileError));
+      }
     }
 
     async function deleteItem(path, name, type) {
@@ -1113,16 +1164,24 @@ PAGE_HTML = """<!doctype html>
       summary.textContent = error.message || "File list failed";
     }
 
-    async function loadFiles(path = currentPath) {
+    async function loadFiles(path = currentPath, page = currentPage) {
       summary.textContent = "Loading files...";
-      const params = new URLSearchParams({ path });
+      const params = new URLSearchParams({
+        path,
+        page: String(page),
+        per_page: "10",
+        search: fileSearch.value.trim(),
+      });
       const response = await fetch(`/api/files?${params.toString()}`, { cache: "no-store" });
       if (!response.ok) throw new Error(`File list failed: ${response.status}`);
       const data = await response.json();
       currentPath = data.path || "";
-      allFolders = (data.folders || []).sort((a, b) => a.name.localeCompare(b.name));
-      allFiles = (data.files || []).sort((a, b) => b.modified - a.modified || a.name.localeCompare(b.name));
-      renderStats(allFiles);
+      currentPagination = data.pagination || { page: 1, perPage: 10, totalItems: 0, totalPages: 1 };
+      currentPage = currentPagination.page || 1;
+      currentStats = data.stats || { fileCount: 0, folderCount: 0, totalSize: 0, latestModified: 0 };
+      allFolders = data.folders || [];
+      allFiles = data.files || [];
+      renderStats(currentStats, currentPagination);
       renderFiles();
     }
 
@@ -1235,10 +1294,10 @@ PAGE_HTML = """<!doctype html>
       setSelectedFiles([]);
     });
     uploadBtn.addEventListener("click", uploadSelectedFiles);
-    refreshBtn.addEventListener("click", () => loadFiles().catch((error) => {
+    refreshBtn.addEventListener("click", () => loadFiles(currentPath, currentPage).catch((error) => {
       summary.textContent = error.message || "Refresh failed";
     }));
-    fileSearch.addEventListener("input", renderFiles);
+    fileSearch.addEventListener("input", () => loadFiles(currentPath, 1).catch(showFileError));
 
     window.addEventListener("dragenter", (event) => {
       event.preventDefault();

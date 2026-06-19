@@ -5,6 +5,7 @@ A small cross-platform Python HTTP server for sharing one folder on a local netw
 ## Features
 
 - Clean browser UI with folder browsing, file search, drag-and-drop file upload, size display, modified timestamps, and delete actions.
+- Server-side folder pagination with at most 10 visible items per page.
 - Folder selection uploads every file recursively while preserving relative paths.
 - Live upload status over WebSocket, including uploads started by other clients.
 - Resumable file downloads through standard HTTP `Range` requests.

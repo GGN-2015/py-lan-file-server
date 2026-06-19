@@ -83,6 +83,36 @@ class ServerIntegrationTests(unittest.TestCase):
         with self.open("/files/docs/readme.txt") as response:
             self.assertEqual(response.read(), b"hello-folder")
 
+    def test_file_list_is_paginated_to_ten_items(self) -> None:
+        for index in range(12):
+            (self.root / f"file-{index:02d}.txt").write_bytes(b"x")
+
+        first_page = self.get_files(page=1, per_page=50)
+        second_page = self.get_files(page=2, per_page=50)
+
+        self.assertEqual(first_page["pagination"], {"page": 1, "perPage": 10, "totalItems": 12, "totalPages": 2})
+        self.assertEqual(len(first_page["files"]), 10)
+        self.assertEqual(second_page["pagination"], {"page": 2, "perPage": 10, "totalItems": 12, "totalPages": 2})
+        self.assertEqual([file["name"] for file in second_page["files"]], ["file-10.txt", "file-11.txt"])
+        self.assertEqual(first_page["stats"]["fileCount"], 12)
+        self.assertEqual(first_page["stats"]["totalSize"], 12)
+
+    def test_file_list_searches_before_paginating(self) -> None:
+        for index in range(14):
+            (self.root / f"match-{index:02d}.txt").write_bytes(b"x")
+        (self.root / "other.txt").write_bytes(b"x")
+
+        page = self.get_files(page=2, search="match")
+
+        self.assertEqual(page["pagination"], {"page": 2, "perPage": 10, "totalItems": 14, "totalPages": 2})
+        self.assertEqual([file["name"] for file in page["files"]], ["match-10.txt", "match-11.txt", "match-12.txt", "match-13.txt"])
+        self.assertEqual(page["search"], "match")
+
+    def test_file_list_rejects_invalid_pagination(self) -> None:
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            self.get_files(page=0)
+        self.assertEqual(raised.exception.code, 400)
+
     def test_folder_download_returns_recursive_zip(self) -> None:
         docs = self.root / "docs"
         (docs / "nested").mkdir(parents=True)
@@ -237,8 +267,8 @@ class ServerIntegrationTests(unittest.TestCase):
         with self.open("/api/upload/status?" + params) as response:
             return json.loads(response.read().decode("utf-8"))
 
-    def get_files(self, path: str = "") -> dict:
-        params = urllib.parse.urlencode({"path": path})
+    def get_files(self, path: str = "", page: int = 1, per_page: int = 10, search: str = "") -> dict:
+        params = urllib.parse.urlencode({"path": path, "page": str(page), "per_page": str(per_page), "search": search})
         with self.open("/api/files?" + params) as response:
             return json.loads(response.read().decode("utf-8"))
 

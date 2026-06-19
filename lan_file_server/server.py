@@ -24,6 +24,7 @@ from typing import Any
 TEMP_DIR_NAME = ".uploads"
 DOWNLOAD_COPY_BLOCK_SIZE = 1024 * 1024
 UPLOAD_COPY_BLOCK_SIZE = 1024 * 1024
+MAX_FILE_LIST_PAGE_SIZE = 10
 WINDOWS_UNSAFE_CHARS = set('<>:"/\\|?*')
 _RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
 _upload_locks: dict[str, threading.Lock] = {}
@@ -342,7 +343,7 @@ class LanFileRequestHandler(BaseHTTPRequestHandler):
     def send_file_list(self) -> None:
         parsed = urllib.parse.urlsplit(self.path)
         try:
-            directory = query_path_value(parsed.query, default="")
+            directory, page, per_page, search = file_list_request_values(parsed.query)
             directory_path = final_file_path(self.storage_root, directory) if directory else self.storage_root
         except BadRequest as exc:
             self.send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
@@ -354,6 +355,11 @@ class LanFileRequestHandler(BaseHTTPRequestHandler):
 
         folders = []
         files = []
+        all_items = []
+        total_file_size = 0
+        latest_modified = 0
+        total_files = 0
+        total_folders = 0
         try:
             entries = sorted(directory_path.iterdir(), key=lambda item: (not item.is_dir(), item.name.casefold()))
         except OSError as exc:
@@ -369,24 +375,42 @@ class LanFileRequestHandler(BaseHTTPRequestHandler):
                 continue
             relative = relative_display_path(entry.relative_to(self.storage_root))
             if entry.is_dir():
-                folders.append(
-                    {
-                        "name": entry.name,
-                        "path": relative,
-                        "modified": int(stat.st_mtime),
-                        "downloadUrl": "/folders/" + quote_path(relative),
-                    }
-                )
+                total_folders += 1
+                folder_item = {
+                    "name": entry.name,
+                    "path": relative,
+                    "modified": int(stat.st_mtime),
+                    "downloadUrl": "/folders/" + quote_path(relative),
+                }
+                all_items.append(("folder", folder_item))
             elif entry.is_file():
-                files.append(
-                    {
-                        "name": entry.name,
-                        "path": relative,
-                        "size": stat.st_size,
-                        "modified": int(stat.st_mtime),
-                        "downloadUrl": "/files/" + quote_path(relative),
-                    }
-                )
+                total_files += 1
+                total_file_size += stat.st_size
+                latest_modified = max(latest_modified, int(stat.st_mtime))
+                file_item = {
+                    "name": entry.name,
+                    "path": relative,
+                    "size": stat.st_size,
+                    "modified": int(stat.st_mtime),
+                    "downloadUrl": "/files/" + quote_path(relative),
+                }
+                all_items.append(("file", file_item))
+
+        if search:
+            folded_search = search.casefold()
+            all_items = [
+                (kind, item)
+                for kind, item in all_items
+                if folded_search in item["name"].casefold() or folded_search in item["path"].casefold()
+            ]
+
+        total_items = len(all_items)
+        total_pages = max(1, (total_items + per_page - 1) // per_page)
+        page = min(page, total_pages)
+        start = (page - 1) * per_page
+        page_items = all_items[start : start + per_page]
+        folders = [item for kind, item in page_items if kind == "folder"]
+        files = [item for kind, item in page_items if kind == "file"]
         parent = parent_display_path(directory)
         current_download_url = "/folders/" + quote_path(directory) if directory else "/folders/"
         self.send_json(
@@ -396,6 +420,19 @@ class LanFileRequestHandler(BaseHTTPRequestHandler):
                 "downloadUrl": current_download_url,
                 "folders": folders,
                 "files": files,
+                "pagination": {
+                    "page": page,
+                    "perPage": per_page,
+                    "totalItems": total_items,
+                    "totalPages": total_pages,
+                },
+                "search": search,
+                "stats": {
+                    "fileCount": total_files,
+                    "folderCount": total_folders,
+                    "totalSize": total_file_size,
+                    "latestModified": latest_modified,
+                },
             }
         )
 
@@ -741,6 +778,20 @@ def upload_request_values(query: str) -> tuple[str, int, str, str]:
     return sanitize_relative_path(raw_path), size, modified, client_id
 
 
+def file_list_request_values(query: str) -> tuple[str, int, int, str]:
+    params = urllib.parse.parse_qs(query, keep_blank_values=True)
+    raw_path = single_query_value(params, "path", default="")
+    directory = sanitize_relative_path(raw_path, allow_empty=True) if raw_path else ""
+    page = parse_positive_int(single_query_value(params, "page", default="1"), "page")
+    requested_per_page = parse_positive_int(
+        single_query_value(params, "per_page", default=str(MAX_FILE_LIST_PAGE_SIZE)),
+        "per_page",
+    )
+    per_page = min(requested_per_page, MAX_FILE_LIST_PAGE_SIZE)
+    search = single_query_value(params, "search", default="").strip()
+    return directory, page, per_page, search
+
+
 def query_path_value(query: str, default: str = "") -> str:
     params = urllib.parse.parse_qs(query, keep_blank_values=True)
     raw_path = single_query_value(params, "path", default=default)
@@ -778,6 +829,13 @@ def parse_non_negative_int(value: str | None, label: str) -> int:
         raise BadRequest(f"{label} must be an integer.") from exc
     if number < 0:
         raise BadRequest(f"{label} must be non-negative.")
+    return number
+
+
+def parse_positive_int(value: str | None, label: str) -> int:
+    number = parse_non_negative_int(value, label)
+    if number < 1:
+        raise BadRequest(f"{label} must be positive.")
     return number
 
 
