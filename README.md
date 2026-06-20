@@ -9,6 +9,7 @@ A small cross-platform Python HTTP server for sharing one folder on a local netw
 - Recursive file count and total size statistics for the current folder.
 - Folder selection uploads every file recursively while preserving relative paths.
 - Live upload status over WebSocket, including uploads started by other clients.
+- Optional PIN protection for the web UI, API, uploads, downloads, and WebSocket connection.
 - Resumable file downloads through standard HTTP `Range` requests.
 - Recursive folder downloads as ZIP archives, including support for resuming interrupted ZIP transfers.
 - Resumable browser uploads through chunked transfer.
@@ -24,7 +25,7 @@ Python 3.9 or newer.
 ## Run From Source
 
 ```bash
-python -m lan_file_server --dir ./shared --host 0.0.0.0 --port 8000 --title "Team Files"
+python -m lan_file_server --dir ./shared --host 0.0.0.0 --port 8000 --title "Team Files" --pin 1234
 ```
 
 Open the URL printed in the terminal. Other devices on the same LAN can use the printed LAN address, for example `http://192.168.1.23:8000/`.
@@ -66,10 +67,20 @@ File downloads support HTTP `Range`, so browsers, download managers, and tools s
 
 Each file and folder row has a `Delete` action. Deleting a folder removes the folder recursively. Connected pages refresh through WebSocket after a successful delete.
 
+## PIN Protection
+
+Use `--pin` to require a PIN before clients can access the page, API, uploads, downloads, delete actions, or WebSocket updates.
+
+```bash
+lan-file-server --dir ./shared --pin 1234
+```
+
+After a successful unlock, the browser receives an HTTP-only cookie containing a random salt and a server-verifiable signature. The PIN itself is not stored in the cookie. If `--pin` is omitted, clients can open the site directly.
+
 ## CLI
 
 ```bash
-lan-file-server [directory] [--dir DIR] [--host HOST] [--port PORT] [--chunk-size BYTES] [--title TITLE]
+lan-file-server [directory] [--dir DIR] [--host HOST] [--port PORT] [--chunk-size BYTES] [--title TITLE] [--pin PIN]
 ```
 
 Common examples:
@@ -78,6 +89,7 @@ Common examples:
 lan-file-server --dir ./shared
 lan-file-server ./shared --host 0.0.0.0 --port 8000
 lan-file-server ./shared --title "Team Files"
+lan-file-server ./shared --pin 1234
 ```
 
 If `--title` is omitted, the browser title and page heading use the default `LAN Files`.

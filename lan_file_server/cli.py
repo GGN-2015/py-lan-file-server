@@ -46,6 +46,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="LAN Files",
         help='Browser page title. Defaults to "LAN Files".',
     )
+    parser.add_argument(
+        "--pin",
+        default=None,
+        help="Require this PIN before clients can access the web UI, API, uploads, and downloads.",
+    )
     return parser
 
 
@@ -59,6 +64,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         port=args.port,
         upload_chunk_size=args.chunk_size,
         page_title=args.title,
+        pin=args.pin,
     )
     return 0
 

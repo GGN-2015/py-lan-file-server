@@ -3,11 +3,13 @@
 import base64
 import email.utils
 import hashlib
+import hmac
 import json
 import mimetypes
 import os
 import posixpath
 import re
+import secrets
 import shutil
 import socket
 import struct
@@ -17,6 +19,7 @@ import time
 import urllib.parse
 import zipfile
 from http import HTTPStatus
+from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -30,6 +33,9 @@ _RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
 _upload_locks: dict[str, threading.Lock] = {}
 _upload_locks_guard = threading.Lock()
 WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+AUTH_COOKIE_NAME = "lan_file_server_auth"
+AUTH_COOKIE_MAX_AGE = 30 * 24 * 60 * 60
+AUTH_CONTEXT = "lan-file-server-auth-v1"
 
 
 class RangeNotSatisfiable(ValueError):
@@ -196,12 +202,13 @@ def create_server(
     port: int = 8000,
     upload_chunk_size: int = 8 * 1024 * 1024,
     page_title: str = "LAN Files",
+    pin: str | None = None,
 ) -> ThreadingHTTPServer:
     root = Path(directory).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
     (root / TEMP_DIR_NAME).mkdir(exist_ok=True)
 
-    handler_class = make_handler(root, upload_chunk_size=max(1, upload_chunk_size), page_title=page_title)
+    handler_class = make_handler(root, upload_chunk_size=max(1, upload_chunk_size), page_title=page_title, pin=pin)
     return ReusableThreadingHTTPServer((host, port), handler_class)
 
 
@@ -211,8 +218,16 @@ def serve_forever(
     port: int = 8000,
     upload_chunk_size: int = 8 * 1024 * 1024,
     page_title: str = "LAN Files",
+    pin: str | None = None,
 ) -> None:
-    with create_server(directory, host=host, port=port, upload_chunk_size=upload_chunk_size, page_title=page_title) as httpd:
+    with create_server(
+        directory,
+        host=host,
+        port=port,
+        upload_chunk_size=upload_chunk_size,
+        page_title=page_title,
+        pin=pin,
+    ) as httpd:
         root = httpd.RequestHandlerClass.storage_root
         bound_host, bound_port = httpd.server_address[:2]
         print(f"Serving directory: {root}")
@@ -256,7 +271,7 @@ def local_ipv4_addresses() -> list[str]:
     return addresses
 
 
-def make_handler(root: Path, upload_chunk_size: int, page_title: str) -> type["LanFileRequestHandler"]:
+def make_handler(root: Path, upload_chunk_size: int, page_title: str, pin: str | None) -> type["LanFileRequestHandler"]:
     websocket_hub = WebSocketHub()
     upload_registry = UploadRegistry(websocket_hub)
 
@@ -268,6 +283,7 @@ def make_handler(root: Path, upload_chunk_size: int, page_title: str) -> type["L
     ConfiguredLanFileRequestHandler.page_title = page_title or "LAN Files"
     ConfiguredLanFileRequestHandler.websocket_hub = websocket_hub
     ConfiguredLanFileRequestHandler.upload_registry = upload_registry
+    ConfiguredLanFileRequestHandler.auth_pin_secret = auth_pin_secret(pin)
 
     return ConfiguredLanFileRequestHandler
 
@@ -279,9 +295,18 @@ class LanFileRequestHandler(BaseHTTPRequestHandler):
     page_title: str
     websocket_hub: WebSocketHub
     upload_registry: UploadRegistry
+    auth_pin_secret: bytes | None
 
     def do_GET(self) -> None:
         parsed = urllib.parse.urlsplit(self.path)
+        if parsed.path == "/auth/login":
+            if auth_cookie_is_valid(self.headers.get("Cookie"), self.auth_pin_secret):
+                self.send_redirect("/")
+            else:
+                self.send_pin_page()
+            return
+        if not self.ensure_authorized(parsed.path):
+            return
         if parsed.path == "/":
             self.send_index()
         elif parsed.path == "/api/files":
@@ -302,6 +327,8 @@ class LanFileRequestHandler(BaseHTTPRequestHandler):
 
     def do_HEAD(self) -> None:
         parsed = urllib.parse.urlsplit(self.path)
+        if not self.ensure_authorized(parsed.path, send_body=False):
+            return
         if parsed.path == "/folders" or parsed.path.startswith("/folders/"):
             encoded_path = "" if parsed.path == "/folders" else parsed.path.removeprefix("/folders/")
             self.send_folder_download(encoded_path, send_body=False)
@@ -312,6 +339,8 @@ class LanFileRequestHandler(BaseHTTPRequestHandler):
 
     def do_PUT(self) -> None:
         parsed = urllib.parse.urlsplit(self.path)
+        if not self.ensure_authorized(parsed.path):
+            return
         if parsed.path == "/api/upload":
             self.receive_upload_chunk(parsed.query)
         else:
@@ -319,6 +348,8 @@ class LanFileRequestHandler(BaseHTTPRequestHandler):
 
     def do_DELETE(self) -> None:
         parsed = urllib.parse.urlsplit(self.path)
+        if not self.ensure_authorized(parsed.path):
+            return
         if parsed.path == "/api/files":
             self.delete_file_or_folder(parsed.query)
         else:
@@ -326,12 +357,87 @@ class LanFileRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urllib.parse.urlsplit(self.path)
+        if parsed.path == "/auth/login":
+            self.handle_auth_login()
+            return
+        if not self.ensure_authorized(parsed.path):
+            return
         if parsed.path == "/api/upload":
             self.receive_upload_chunk(parsed.query)
         elif parsed.path == "/api/upload/cancel":
             self.cancel_upload(parsed.query)
         else:
             self.send_error(HTTPStatus.NOT_FOUND, "Not found")
+
+    def ensure_authorized(self, path: str, send_body: bool = True) -> bool:
+        if auth_cookie_is_valid(self.headers.get("Cookie"), self.auth_pin_secret):
+            return True
+        if path == "/" and send_body:
+            self.send_pin_page()
+        else:
+            self.send_auth_required(send_body=send_body)
+        return False
+
+    def handle_auth_login(self) -> None:
+        if self.auth_pin_secret is None:
+            self.send_redirect("/")
+            return
+
+        try:
+            content_length = parse_content_length(self.headers.get("Content-Length"))
+        except BadRequest as exc:
+            self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+
+        if content_length > 4096:
+            self.close_connection = True
+            self.send_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "PIN form is too large.")
+            return
+
+        body = self.rfile.read(content_length)
+        try:
+            params = urllib.parse.parse_qs(body.decode("utf-8"), keep_blank_values=True)
+        except UnicodeDecodeError:
+            self.send_error(HTTPStatus.BAD_REQUEST, "PIN form must be UTF-8 encoded.")
+            return
+
+        pin = single_query_value(params, "pin", default="")
+        if pin_matches(self.auth_pin_secret, pin):
+            self.send_redirect("/", set_cookie=make_auth_cookie(self.auth_pin_secret))
+            return
+
+        self.send_pin_page(failed=True, status=HTTPStatus.UNAUTHORIZED)
+
+    def send_redirect(self, location: str, set_cookie: str | None = None) -> None:
+        self.send_response(HTTPStatus.SEE_OTHER)
+        self.send_header("Location", location)
+        if set_cookie:
+            self.send_header("Set-Cookie", set_cookie)
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
+    def send_pin_page(self, failed: bool = False, status: HTTPStatus = HTTPStatus.OK) -> None:
+        from .ui import render_pin_page
+
+        body = render_pin_page(self.page_title, failed=failed).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_auth_required(self, send_body: bool = True) -> None:
+        body = b"PIN required."
+        self.send_response(HTTPStatus.UNAUTHORIZED)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body) if send_body else 0))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if send_body:
+            self.wfile.write(body)
+        self.close_connection = True
 
     def send_index(self) -> None:
         from .ui import render_index as render_ui
@@ -772,6 +878,57 @@ def upload_request_values(query: str) -> tuple[str, int, str, str]:
     modified = single_query_value(params, "mtime", default="0")
     client_id = sanitize_client_id(single_query_value(params, "client", default="unknown"))
     return sanitize_relative_path(raw_path), size, modified, client_id
+
+
+def auth_pin_secret(pin: str | None) -> bytes | None:
+    if pin is None:
+        return None
+    pin = str(pin)
+    if pin == "":
+        return None
+    return hashlib.pbkdf2_hmac("sha256", pin.encode("utf-8"), AUTH_CONTEXT.encode("ascii"), 120_000)
+
+
+def pin_matches(configured_secret: bytes, candidate_pin: str) -> bool:
+    candidate_secret = auth_pin_secret(candidate_pin)
+    return candidate_secret is not None and hmac.compare_digest(candidate_secret, configured_secret)
+
+
+def make_auth_cookie(configured_secret: bytes) -> str:
+    salt = secrets.token_hex(16)
+    value = f"{salt}.{auth_signature(configured_secret, salt)}"
+    return (
+        f"{AUTH_COOKIE_NAME}={value}; Path=/; HttpOnly; "
+        f"SameSite=Lax; Max-Age={AUTH_COOKIE_MAX_AGE}"
+    )
+
+
+def auth_signature(configured_secret: bytes, salt: str) -> str:
+    message = f"{AUTH_CONTEXT}:{salt}".encode("ascii")
+    return hmac.new(configured_secret, message, hashlib.sha256).hexdigest()
+
+
+def auth_cookie_is_valid(cookie_header: str | None, configured_secret: bytes | None) -> bool:
+    if configured_secret is None:
+        return True
+    if not cookie_header:
+        return False
+    cookie = SimpleCookie()
+    try:
+        cookie.load(cookie_header)
+    except CookieError:
+        return False
+    morsel = cookie.get(AUTH_COOKIE_NAME)
+    if not morsel:
+        return False
+    try:
+        salt, signature = morsel.value.split(".", 1)
+    except ValueError:
+        return False
+    if not re.fullmatch(r"[0-9a-f]{32}", salt) or not re.fullmatch(r"[0-9a-f]{64}", signature):
+        return False
+    expected = auth_signature(configured_secret, salt)
+    return hmac.compare_digest(signature, expected)
 
 
 def file_list_request_values(query: str) -> tuple[str, int, int, str]:

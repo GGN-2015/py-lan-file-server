@@ -16,6 +16,144 @@ def render_index(upload_chunk_size: int, page_title: str = DEFAULT_PAGE_TITLE) -
     )
 
 
+def render_pin_page(page_title: str = DEFAULT_PAGE_TITLE, failed: bool = False) -> str:
+    escaped_title = html.escape(page_title or DEFAULT_PAGE_TITLE)
+    error = '<p class="error" role="alert">Incorrect PIN. Please try again.</p>' if failed else ""
+    return (
+        PIN_PAGE_HTML
+        .replace("__PAGE_TITLE__", escaped_title)
+        .replace("__PIN_ERROR__", error)
+    )
+
+
+PIN_PAGE_HTML = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>__PAGE_TITLE__</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f5f7fb;
+      --fg: #18212f;
+      --muted: #667085;
+      --line: #d9e0ea;
+      --accent: #2563eb;
+      --accent-strong: #1d4ed8;
+      --surface: #ffffff;
+      --danger: #b42318;
+      --shadow: 0 18px 48px rgb(24 33 47 / 0.12);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #111418;
+        --fg: #edf2f8;
+        --muted: #a6b0bf;
+        --line: #2d3746;
+        --accent: #60a5fa;
+        --accent-strong: #93c5fd;
+        --surface: #171c22;
+        --danger: #ff8a80;
+        --shadow: 0 18px 48px rgb(0 0 0 / 0.26);
+      }
+    }
+    * {
+      box-sizing: border-box;
+    }
+    html {
+      min-width: 320px;
+    }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+      background: var(--bg);
+      color: var(--fg);
+    }
+    main {
+      width: min(420px, 100%);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface);
+      box-shadow: var(--shadow);
+      padding: 26px;
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 28px;
+      line-height: 1.05;
+      letter-spacing: 0;
+    }
+    p {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.5;
+    }
+    form {
+      display: grid;
+      gap: 12px;
+      margin-top: 22px;
+    }
+    label {
+      font-weight: 700;
+    }
+    input,
+    button {
+      min-height: 42px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--surface);
+      color: var(--fg);
+      font: inherit;
+      letter-spacing: 0;
+    }
+    input {
+      width: 100%;
+      padding: 9px 11px;
+    }
+    input:focus,
+    button:focus-visible {
+      outline: 3px solid color-mix(in srgb, var(--accent) 28%, transparent);
+      outline-offset: 2px;
+      border-color: var(--accent-strong);
+    }
+    button {
+      border-color: var(--accent);
+      background: var(--accent);
+      color: white;
+      font-weight: 750;
+      cursor: pointer;
+    }
+    button:hover {
+      background: var(--accent-strong);
+    }
+    .error {
+      margin-top: 14px;
+      color: var(--danger);
+      font-weight: 700;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>__PAGE_TITLE__</h1>
+    <p>This file server is protected. Enter the PIN to continue.</p>
+    __PIN_ERROR__
+    <form method="post" action="/auth/login">
+      <label for="pin">PIN</label>
+      <input id="pin" name="pin" type="password" autocomplete="current-password" autofocus required>
+      <button type="submit">Unlock</button>
+    </form>
+  </main>
+</body>
+</html>
+"""
+
+
 PAGE_HTML = """<!doctype html>
 <html lang="en">
 <head>

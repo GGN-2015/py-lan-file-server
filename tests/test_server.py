@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import io
 import os
 import json
@@ -18,6 +19,11 @@ import zipfile
 from pathlib import Path
 
 from lan_file_server.server import RangeNotSatisfiable, create_server, parse_http_range
+
+
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 class RangeParsingTests(unittest.TestCase):
@@ -48,6 +54,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertIn("usage: lan-file-server", result.stdout)
         self.assertIn("--title", result.stdout)
+        self.assertIn("--pin", result.stdout)
 
 
 class ServerIntegrationTests(unittest.TestCase):
@@ -108,6 +115,72 @@ class ServerIntegrationTests(unittest.TestCase):
 
         self.assertIn("<title>Team Share &lt;One&gt;</title>", body)
         self.assertIn("<h1>Team Share &lt;One&gt;</h1>", body)
+
+    def test_pin_protects_site_and_api_until_login(self) -> None:
+        (self.root / "secret.txt").write_bytes(b"secret")
+        with self.protected_server(pin="1234") as protected:
+            base_url = protected["base_url"]
+
+            with urllib.request.urlopen(base_url + "/", timeout=5) as response:
+                body = response.read().decode("utf-8")
+            self.assertIn("This file server is protected", body)
+            self.assertIn('action="/auth/login"', body)
+            self.assertNotIn('id="files"', body)
+
+            with self.assertRaises(urllib.error.HTTPError) as unauthorized:
+                urllib.request.urlopen(base_url + "/api/files", timeout=5)
+            self.assertEqual(unauthorized.exception.code, 401)
+
+            with self.assertRaises(urllib.error.HTTPError) as wrong_pin:
+                self.login_cookie(base_url, "0000")
+            self.assertEqual(wrong_pin.exception.code, 401)
+            self.assertIn("Incorrect PIN", wrong_pin.exception.read().decode("utf-8"))
+
+            cookie = self.login_cookie(base_url, "1234")
+            cookie_header = cookie.split(";", 1)[0]
+            self.assertNotIn("1234", cookie)
+            self.assertRegex(cookie_header, r"^lan_file_server_auth=[0-9a-f]{32}\.[0-9a-f]{64}$")
+
+            request = urllib.request.Request(base_url + "/api/files", headers={"Cookie": cookie_header})
+            with urllib.request.urlopen(request, timeout=5) as response:
+                listing = json.loads(response.read().decode("utf-8"))
+            self.assertEqual(listing["files"][0]["name"], "secret.txt")
+
+            request = urllib.request.Request(base_url + "/", headers={"Cookie": cookie_header})
+            with urllib.request.urlopen(request, timeout=5) as response:
+                body = response.read().decode("utf-8")
+            self.assertIn('id="files"', body)
+
+    def test_pin_cookie_uses_a_fresh_salt(self) -> None:
+        with self.protected_server(pin="1234") as protected:
+            base_url = protected["base_url"]
+            first_cookie = self.login_cookie(base_url, "1234").split(";", 1)[0]
+            second_cookie = self.login_cookie(base_url, "1234").split(";", 1)[0]
+
+        self.assertNotEqual(first_cookie, second_cookie)
+
+    def test_pin_protects_websocket_upgrade(self) -> None:
+        with self.protected_server(pin="1234") as protected:
+            sock = socket.create_connection(("127.0.0.1", protected["port"]), timeout=5)
+            try:
+                key = base64.b64encode(os.urandom(16)).decode("ascii")
+                request = (
+                    "GET /ws?client=observer HTTP/1.1\r\n"
+                    f"Host: 127.0.0.1:{protected['port']}\r\n"
+                    "Upgrade: websocket\r\n"
+                    "Connection: Upgrade\r\n"
+                    f"Sec-WebSocket-Key: {key}\r\n"
+                    "Sec-WebSocket-Version: 13\r\n"
+                    "\r\n"
+                )
+                sock.sendall(request.encode("ascii"))
+                response = b""
+                while b"\r\n\r\n" not in response:
+                    response += sock.recv(1)
+            finally:
+                sock.close()
+
+        self.assertIn(b" 401 ", response)
 
     def test_file_list_supports_folders_and_nested_downloads(self) -> None:
         nested = self.root / "docs"
@@ -337,6 +410,45 @@ class ServerIntegrationTests(unittest.TestCase):
     def get_uploads(self) -> list[dict]:
         with self.open("/api/uploads") as response:
             return json.loads(response.read().decode("utf-8"))["uploads"]
+
+    @contextlib.contextmanager
+    def protected_server(self, pin: str):
+        httpd = create_server(self.root, host="127.0.0.1", port=0, upload_chunk_size=4, pin=pin)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            yield {
+                "httpd": httpd,
+                "base_url": f"http://127.0.0.1:{httpd.server_address[1]}",
+                "port": httpd.server_address[1],
+            }
+        finally:
+            httpd.shutdown()
+            thread.join(timeout=5)
+            httpd.server_close()
+
+    def login_cookie(self, base_url: str, pin: str) -> str:
+        data = urllib.parse.urlencode({"pin": pin}).encode("utf-8")
+        request = urllib.request.Request(
+            base_url + "/auth/login",
+            data=data,
+            method="POST",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        opener = urllib.request.build_opener(NoRedirectHandler)
+        try:
+            with opener.open(request, timeout=5) as response:
+                if response.status == 303:
+                    cookie = response.headers["Set-Cookie"]
+                    self.assertIsNotNone(cookie)
+                    return cookie
+        except urllib.error.HTTPError as exc:
+            if exc.code == 303:
+                cookie = exc.headers["Set-Cookie"]
+                self.assertIsNotNone(cookie)
+                return cookie
+            raise
+        self.fail("PIN login did not return a redirect.")
 
     def cancel_upload(self, name: str, total: int, mtime: str = "1", client: str = "test-client") -> dict:
         params = urllib.parse.urlencode({"path": name, "size": str(total), "mtime": mtime, "client": client})
