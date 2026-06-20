@@ -195,12 +195,13 @@ def create_server(
     host: str = "0.0.0.0",
     port: int = 8000,
     upload_chunk_size: int = 8 * 1024 * 1024,
+    page_title: str = "LAN Files",
 ) -> ThreadingHTTPServer:
     root = Path(directory).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
     (root / TEMP_DIR_NAME).mkdir(exist_ok=True)
 
-    handler_class = make_handler(root, upload_chunk_size=max(1, upload_chunk_size))
+    handler_class = make_handler(root, upload_chunk_size=max(1, upload_chunk_size), page_title=page_title)
     return ReusableThreadingHTTPServer((host, port), handler_class)
 
 
@@ -209,8 +210,9 @@ def serve_forever(
     host: str = "0.0.0.0",
     port: int = 8000,
     upload_chunk_size: int = 8 * 1024 * 1024,
+    page_title: str = "LAN Files",
 ) -> None:
-    with create_server(directory, host=host, port=port, upload_chunk_size=upload_chunk_size) as httpd:
+    with create_server(directory, host=host, port=port, upload_chunk_size=upload_chunk_size, page_title=page_title) as httpd:
         root = httpd.RequestHandlerClass.storage_root
         bound_host, bound_port = httpd.server_address[:2]
         print(f"Serving directory: {root}")
@@ -254,7 +256,7 @@ def local_ipv4_addresses() -> list[str]:
     return addresses
 
 
-def make_handler(root: Path, upload_chunk_size: int) -> type["LanFileRequestHandler"]:
+def make_handler(root: Path, upload_chunk_size: int, page_title: str) -> type["LanFileRequestHandler"]:
     websocket_hub = WebSocketHub()
     upload_registry = UploadRegistry(websocket_hub)
 
@@ -263,6 +265,7 @@ def make_handler(root: Path, upload_chunk_size: int) -> type["LanFileRequestHand
 
     ConfiguredLanFileRequestHandler.storage_root = root
     ConfiguredLanFileRequestHandler.browser_upload_chunk_size = upload_chunk_size
+    ConfiguredLanFileRequestHandler.page_title = page_title or "LAN Files"
     ConfiguredLanFileRequestHandler.websocket_hub = websocket_hub
     ConfiguredLanFileRequestHandler.upload_registry = upload_registry
 
@@ -273,6 +276,7 @@ class LanFileRequestHandler(BaseHTTPRequestHandler):
     server_version = "LanFileServer/0.1"
     storage_root: Path
     browser_upload_chunk_size: int
+    page_title: str
     websocket_hub: WebSocketHub
     upload_registry: UploadRegistry
 
@@ -332,7 +336,7 @@ class LanFileRequestHandler(BaseHTTPRequestHandler):
     def send_index(self) -> None:
         from .ui import render_index as render_ui
 
-        body = render_ui(self.browser_upload_chunk_size).encode("utf-8")
+        body = render_ui(self.browser_upload_chunk_size, self.page_title).encode("utf-8")
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -356,11 +360,8 @@ class LanFileRequestHandler(BaseHTTPRequestHandler):
         folders = []
         files = []
         all_items = []
-        total_file_size = 0
-        latest_modified = 0
-        total_files = 0
-        total_folders = 0
         try:
+            stats = recursive_file_stats(directory_path, self.storage_root)
             entries = sorted(directory_path.iterdir(), key=lambda item: (not item.is_dir(), item.name.casefold()))
         except OSError as exc:
             self.send_json({"error": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
@@ -375,7 +376,6 @@ class LanFileRequestHandler(BaseHTTPRequestHandler):
                 continue
             relative = relative_display_path(entry.relative_to(self.storage_root))
             if entry.is_dir():
-                total_folders += 1
                 folder_item = {
                     "name": entry.name,
                     "path": relative,
@@ -384,9 +384,6 @@ class LanFileRequestHandler(BaseHTTPRequestHandler):
                 }
                 all_items.append(("folder", folder_item))
             elif entry.is_file():
-                total_files += 1
-                total_file_size += stat.st_size
-                latest_modified = max(latest_modified, int(stat.st_mtime))
                 file_item = {
                     "name": entry.name,
                     "path": relative,
@@ -428,10 +425,9 @@ class LanFileRequestHandler(BaseHTTPRequestHandler):
                 },
                 "search": search,
                 "stats": {
-                    "fileCount": total_files,
-                    "folderCount": total_folders,
-                    "totalSize": total_file_size,
-                    "latestModified": latest_modified,
+                    "fileCount": stats["fileCount"],
+                    "totalSize": stats["totalSize"],
+                    "latestModified": stats["latestModified"],
                 },
             }
         )
@@ -913,6 +909,32 @@ def parent_display_path(relative_path: str) -> str | None:
 
 def quote_path(relative_path: str) -> str:
     return urllib.parse.quote(relative_path, safe="/")
+
+
+def recursive_file_stats(directory_path: Path, storage_root: Path) -> dict[str, int]:
+    file_count = 0
+    total_size = 0
+    latest_modified = 0
+    for current_root, dir_names, file_names in os.walk(directory_path):
+        current_path = Path(current_root)
+        dir_names[:] = [
+            name
+            for name in dir_names
+            if not (current_path == storage_root and name.casefold() == TEMP_DIR_NAME.casefold())
+            and not (current_path / name).is_symlink()
+        ]
+        for file_name in file_names:
+            file_path = current_path / file_name
+            if file_path.is_symlink() or not file_path.is_file():
+                continue
+            try:
+                stat = file_path.stat()
+            except OSError:
+                continue
+            file_count += 1
+            total_size += stat.st_size
+            latest_modified = max(latest_modified, int(stat.st_mtime))
+    return {"fileCount": file_count, "totalSize": total_size, "latestModified": latest_modified}
 
 
 def folder_archive_name(relative_path: str) -> str:

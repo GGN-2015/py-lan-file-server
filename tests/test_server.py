@@ -6,6 +6,8 @@ import os
 import json
 import socket
 import struct
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -31,6 +33,21 @@ class RangeParsingTests(unittest.TestCase):
     def test_reject_unsatisfiable_range(self) -> None:
         with self.assertRaises(RangeNotSatisfiable):
             parse_http_range("bytes=12-20", 10)
+
+
+class CliTests(unittest.TestCase):
+    def test_cli_module_executes_main(self) -> None:
+        result = subprocess.run(
+            [sys.executable, "-m", "lan_file_server.cli", "--help"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("usage: lan-file-server", result.stdout)
+        self.assertIn("--title", result.stdout)
 
 
 class ServerIntegrationTests(unittest.TestCase):
@@ -64,6 +81,34 @@ class ServerIntegrationTests(unittest.TestCase):
             self.assertEqual(response.headers["Accept-Ranges"], "bytes")
             self.assertEqual(response.read(), b"2345")
 
+    def test_index_uses_default_title(self) -> None:
+        with self.open("/") as response:
+            body = response.read().decode("utf-8")
+
+        self.assertIn("<title>LAN Files</title>", body)
+        self.assertIn("<h1>LAN Files</h1>", body)
+
+    def test_index_uses_configured_title(self) -> None:
+        with create_server(
+            self.root,
+            host="127.0.0.1",
+            port=0,
+            upload_chunk_size=4,
+            page_title='Team Share <One>',
+        ) as titled_server:
+            thread = threading.Thread(target=titled_server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                base_url = f"http://127.0.0.1:{titled_server.server_address[1]}"
+                with urllib.request.urlopen(base_url + "/", timeout=5) as response:
+                    body = response.read().decode("utf-8")
+            finally:
+                titled_server.shutdown()
+                thread.join(timeout=5)
+
+        self.assertIn("<title>Team Share &lt;One&gt;</title>", body)
+        self.assertIn("<h1>Team Share &lt;One&gt;</h1>", body)
+
     def test_file_list_supports_folders_and_nested_downloads(self) -> None:
         nested = self.root / "docs"
         nested.mkdir()
@@ -96,6 +141,23 @@ class ServerIntegrationTests(unittest.TestCase):
         self.assertEqual([file["name"] for file in second_page["files"]], ["file-10.txt", "file-11.txt"])
         self.assertEqual(first_page["stats"]["fileCount"], 12)
         self.assertEqual(first_page["stats"]["totalSize"], 12)
+
+    def test_file_list_stats_include_nested_files_only(self) -> None:
+        (self.root / "top.txt").write_bytes(b"123")
+        (self.root / "docs" / "nested").mkdir(parents=True)
+        (self.root / "docs" / "readme.txt").write_bytes(b"12345")
+        (self.root / "docs" / "nested" / "guide.txt").write_bytes(b"1234567")
+        (self.root / "docs" / "empty").mkdir()
+        (self.root / ".uploads" / "hidden.part").write_bytes(b"hidden")
+
+        root_listing = self.get_files()
+        docs_listing = self.get_files("docs")
+
+        self.assertEqual(root_listing["stats"]["fileCount"], 3)
+        self.assertEqual(root_listing["stats"]["totalSize"], 15)
+        self.assertNotIn("folderCount", root_listing["stats"])
+        self.assertEqual(docs_listing["stats"]["fileCount"], 2)
+        self.assertEqual(docs_listing["stats"]["totalSize"], 12)
 
     def test_file_list_searches_before_paginating(self) -> None:
         for index in range(14):

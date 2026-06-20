@@ -6,6 +6,7 @@ A small cross-platform Python HTTP server for sharing one folder on a local netw
 
 - Clean browser UI with folder browsing, file search, drag-and-drop file upload, size display, modified timestamps, and delete actions.
 - Server-side folder pagination with at most 10 visible items per page.
+- Recursive file count and total size statistics for the current folder.
 - Folder selection uploads every file recursively while preserving relative paths.
 - Live upload status over WebSocket, including uploads started by other clients.
 - Resumable file downloads through standard HTTP `Range` requests.
@@ -23,7 +24,7 @@ Python 3.9 or newer.
 ## Run From Source
 
 ```bash
-python -m lan_file_server --dir ./shared --host 0.0.0.0 --port 8000
+python -m lan_file_server --dir ./shared --host 0.0.0.0 --port 8000 --title "Team Files"
 ```
 
 Open the URL printed in the terminal. Other devices on the same LAN can use the printed LAN address, for example `http://192.168.1.23:8000/`.
@@ -68,7 +69,7 @@ Each file and folder row has a `Delete` action. Deleting a folder removes the fo
 ## CLI
 
 ```bash
-lan-file-server [directory] [--dir DIR] [--host HOST] [--port PORT] [--chunk-size BYTES]
+lan-file-server [directory] [--dir DIR] [--host HOST] [--port PORT] [--chunk-size BYTES] [--title TITLE]
 ```
 
 Common examples:
@@ -76,4 +77,7 @@ Common examples:
 ```bash
 lan-file-server --dir ./shared
 lan-file-server ./shared --host 0.0.0.0 --port 8000
+lan-file-server ./shared --title "Team Files"
 ```
+
+If `--title` is omitted, the browser title and page heading use the default `LAN Files`.

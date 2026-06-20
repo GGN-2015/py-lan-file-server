@@ -41,6 +41,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=8 * 1024 * 1024,
         help="Browser upload chunk size in bytes.",
     )
+    parser.add_argument(
+        "--title",
+        default="LAN Files",
+        help='Browser page title. Defaults to "LAN Files".',
+    )
     return parser
 
 
@@ -48,5 +53,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     directory = Path(args.directory_option or args.directory or "shared")
-    serve_forever(directory, host=args.host, port=args.port, upload_chunk_size=args.chunk_size)
+    serve_forever(
+        directory,
+        host=args.host,
+        port=args.port,
+        upload_chunk_size=args.chunk_size,
+        page_title=args.title,
+    )
     return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

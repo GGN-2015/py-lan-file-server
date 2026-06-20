@@ -3,9 +3,17 @@ from __future__ import annotations
 import html
 
 
-def render_index(upload_chunk_size: int) -> str:
+DEFAULT_PAGE_TITLE = "LAN Files"
+
+
+def render_index(upload_chunk_size: int, page_title: str = DEFAULT_PAGE_TITLE) -> str:
     escaped_chunk_size = html.escape(str(upload_chunk_size), quote=True)
-    return PAGE_HTML.replace("__UPLOAD_CHUNK_SIZE__", escaped_chunk_size)
+    escaped_title = html.escape(page_title or DEFAULT_PAGE_TITLE)
+    return (
+        PAGE_HTML
+        .replace("__UPLOAD_CHUNK_SIZE__", escaped_chunk_size)
+        .replace("__PAGE_TITLE__", escaped_title)
+    )
 
 
 PAGE_HTML = """<!doctype html>
@@ -13,7 +21,7 @@ PAGE_HTML = """<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>LAN Files</title>
+  <title>__PAGE_TITLE__</title>
   <style>
     :root {
       color-scheme: light dark;
@@ -560,7 +568,7 @@ PAGE_HTML = """<!doctype html>
   <main>
     <header>
       <div>
-        <h1>LAN Files</h1>
+        <h1>__PAGE_TITLE__</h1>
         <div id="summary" class="subtitle">Loading files...</div>
       </div>
       <div class="stats" aria-live="polite">
@@ -663,7 +671,7 @@ PAGE_HTML = """<!doctype html>
     let currentPath = "";
     let currentPage = 1;
     let currentPagination = { page: 1, perPage: 10, totalItems: 0, totalPages: 1 };
-    let currentStats = { fileCount: 0, folderCount: 0, totalSize: 0, latestModified: 0 };
+    let currentStats = { fileCount: 0, totalSize: 0, latestModified: 0 };
     let activeUploadItems = [];
     let activeUploadRows = new Map();
     let localUploadBatch = null;
@@ -985,12 +993,11 @@ PAGE_HTML = """<!doctype html>
 
     function renderStats(stats, pagination) {
       const totalFiles = stats.fileCount || 0;
-      const totalFolders = stats.folderCount || 0;
       fileCount.textContent = String(totalFiles);
       totalSize.textContent = formatBytes(stats.totalSize || 0);
       latestTime.textContent = formatShortDate(stats.latestModified || 0);
-      summary.textContent = totalFiles || totalFolders
-        ? `${totalFiles} ${plural(totalFiles, "file", "files")} / ${totalFolders} ${plural(totalFolders, "folder", "folders")} / ${formatBytes(stats.totalSize || 0)}`
+      summary.textContent = totalFiles
+        ? `${totalFiles} ${plural(totalFiles, "file", "files")} / ${formatBytes(stats.totalSize || 0)}`
         : "No files yet";
       if (pagination && pagination.totalItems && fileSearch.value.trim()) {
         summary.textContent += ` - ${pagination.totalItems} matching ${plural(pagination.totalItems, "item", "items")}`;
@@ -1005,12 +1012,12 @@ PAGE_HTML = """<!doctype html>
       downloadFolderBtn.download = folderZipName(currentPath);
 
       if (!folders.length && !files.length && !currentPath) {
-        filesSection.innerHTML = `<div class="empty">${currentStats.fileCount || currentStats.folderCount ? "No matching items" : "No files yet"}</div>${paginationMarkup()}`;
+        filesSection.innerHTML = `<div class="empty">${currentPagination.totalItems ? "No matching items" : "No files yet"}</div>${paginationMarkup()}`;
         bindPaginationControls();
         return;
       }
       if (!folders.length && !files.length && currentPath) {
-        filesSection.innerHTML = `<div class="empty">${currentStats.fileCount || currentStats.folderCount ? "No matching items" : "This folder is empty"}</div>${paginationMarkup()}`;
+        filesSection.innerHTML = `<div class="empty">${currentPagination.totalItems ? "No matching items" : "This folder is empty"}</div>${paginationMarkup()}`;
         bindPaginationControls();
         return;
       }
@@ -1178,7 +1185,7 @@ PAGE_HTML = """<!doctype html>
       currentPath = data.path || "";
       currentPagination = data.pagination || { page: 1, perPage: 10, totalItems: 0, totalPages: 1 };
       currentPage = currentPagination.page || 1;
-      currentStats = data.stats || { fileCount: 0, folderCount: 0, totalSize: 0, latestModified: 0 };
+      currentStats = data.stats || { fileCount: 0, totalSize: 0, latestModified: 0 };
       allFolders = data.folders || [];
       allFiles = data.files || [];
       renderStats(currentStats, currentPagination);
