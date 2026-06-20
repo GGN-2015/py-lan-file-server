@@ -94,6 +94,8 @@ class ServerIntegrationTests(unittest.TestCase):
 
         self.assertIn("<title>LAN Files</title>", body)
         self.assertIn("<h1>LAN Files</h1>", body)
+        self.assertIn('aria-label="Folder path"', body)
+        self.assertIn('upButton.textContent = "Up"', body)
 
     def test_index_uses_configured_title(self) -> None:
         with create_server(

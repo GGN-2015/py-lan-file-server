@@ -284,7 +284,7 @@ PAGE_HTML = """<!doctype html>
       letter-spacing: 0;
     }
     #currentPath {
-      margin-top: 4px;
+      margin-top: 7px;
       overflow-wrap: anywhere;
     }
     .panel-head,
@@ -348,6 +348,50 @@ PAGE_HTML = """<!doctype html>
     button:disabled {
       cursor: not-allowed;
       opacity: 0.48;
+    }
+    .path-nav {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 6px;
+      min-height: 34px;
+    }
+    .path-button,
+    .path-current {
+      min-height: 30px;
+      border-radius: 6px;
+      font-size: 13px;
+      line-height: 1.2;
+      max-width: 100%;
+      overflow-wrap: anywhere;
+      white-space: normal;
+      text-align: left;
+    }
+    .path-button {
+      padding: 5px 9px;
+      border-color: var(--line);
+      background: var(--surface-raised);
+      color: var(--fg);
+      font-weight: 650;
+    }
+    .path-button.up {
+      border-color: color-mix(in srgb, var(--accent) 35%, var(--line));
+      color: var(--accent-strong);
+    }
+    .path-current {
+      display: inline-flex;
+      align-items: center;
+      padding: 5px 9px;
+      border: 1px solid color-mix(in srgb, var(--accent) 26%, var(--line));
+      background: color-mix(in srgb, var(--accent) 8%, var(--surface));
+      color: var(--fg);
+      font-weight: 750;
+      overflow-wrap: anywhere;
+    }
+    .path-separator {
+      color: var(--muted);
+      font-size: 13px;
+      user-select: none;
     }
     #clearBtn:disabled {
       visibility: hidden;
@@ -762,7 +806,7 @@ PAGE_HTML = """<!doctype html>
         <div class="files-head">
           <div>
             <h2 id="filesTitle" class="files-title">Files</h2>
-            <div id="currentPath" class="meta"></div>
+            <nav id="currentPath" class="path-nav" aria-label="Folder path"></nav>
           </div>
           <div class="actions">
             <label class="search-wrap">
@@ -903,6 +947,57 @@ PAGE_HTML = """<!doctype html>
     function folderDownloadUrl(path) {
       const encoded = encodedRelativePath(path);
       return encoded ? `/folders/${encoded}` : "/folders/";
+    }
+
+    function ancestorPaths(path) {
+      const parts = normalizeRelativePath(path).split("/").filter(Boolean);
+      const ancestors = [{ name: "Root", path: "" }];
+      let built = "";
+      for (const part of parts) {
+        built = built ? `${built}/${part}` : part;
+        ancestors.push({ name: part, path: built });
+      }
+      return ancestors;
+    }
+
+    function renderPathNav() {
+      currentPathLabel.innerHTML = "";
+      if (currentPath) {
+        const upButton = document.createElement("button");
+        upButton.type = "button";
+        upButton.className = "path-button up";
+        upButton.textContent = "Up";
+        upButton.title = "Open parent folder";
+        upButton.addEventListener("click", () => loadFiles(parentPath(currentPath), 1).catch(showFileError));
+        currentPathLabel.appendChild(upButton);
+      }
+
+      for (const [index, ancestor] of ancestorPaths(currentPath).entries()) {
+        if (index > 0) {
+          const separator = document.createElement("span");
+          separator.className = "path-separator";
+          separator.setAttribute("aria-hidden", "true");
+          separator.textContent = "/";
+          currentPathLabel.appendChild(separator);
+        }
+
+        if (ancestor.path === currentPath) {
+          const current = document.createElement("span");
+          current.className = "path-current";
+          current.setAttribute("aria-current", "page");
+          current.textContent = ancestor.name;
+          currentPathLabel.appendChild(current);
+          continue;
+        }
+
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "path-button";
+        button.textContent = ancestor.name;
+        button.title = ancestor.path ? `Open ${ancestor.path}` : "Open root folder";
+        button.addEventListener("click", () => loadFiles(ancestor.path, 1).catch(showFileError));
+        currentPathLabel.appendChild(button);
+      }
     }
 
     function setSelectedFiles(files) {
@@ -1145,7 +1240,7 @@ PAGE_HTML = """<!doctype html>
     function renderFiles() {
       const folders = allFolders;
       const files = allFiles;
-      currentPathLabel.textContent = currentPath ? `/${currentPath}` : "/";
+      renderPathNav();
       downloadFolderBtn.href = folderDownloadUrl(currentPath);
       downloadFolderBtn.download = folderZipName(currentPath);
 
@@ -1175,25 +1270,6 @@ PAGE_HTML = """<!doctype html>
         ${paginationMarkup()}
       `;
       const tbody = filesSection.querySelector("tbody");
-      if (currentPath) {
-        const row = document.createElement("tr");
-        row.innerHTML = `
-          <td data-label="Name">
-            <div class="name-cell">
-              <span class="file-mark" aria-hidden="true">D</span>
-              <a class="file-link" href="#">..</a>
-            </div>
-          </td>
-          <td data-label="Size" class="size">Folder</td>
-          <td data-label="Modified"></td>
-          <td data-label="Actions"></td>
-        `;
-        row.querySelector(".file-link").addEventListener("click", (event) => {
-          event.preventDefault();
-          loadFiles(parentPath(currentPath), 1).catch(showFileError);
-        });
-        tbody.appendChild(row);
-      }
       for (const folder of folders) {
         const row = document.createElement("tr");
         row.innerHTML = `

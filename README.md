@@ -4,7 +4,7 @@ A small cross-platform Python HTTP server for sharing one folder on a local netw
 
 ## Features
 
-- Clean browser UI with folder browsing, file search, drag-and-drop file upload, size display, modified timestamps, and delete actions.
+- Clean browser UI with folder browsing, ancestor navigation, file search, drag-and-drop file upload, size display, modified timestamps, and delete actions.
 - Server-side folder pagination with at most 10 visible items per page.
 - Recursive file count and total size statistics for the current folder.
 - Folder selection uploads every file recursively while preserving relative paths.
@@ -41,7 +41,7 @@ lan-file-server --dir ./shared --port 8000
 
 ## Folders
 
-The shared directory may contain nested folders. The browser UI lets users open folders, go back to parent folders, download files from any level, and delete files or entire folders.
+The shared directory may contain nested folders. The browser UI lets users open folders, use `Up` to return to the parent folder, jump directly to any ancestor folder from the path bar, download files from any level, and delete files or entire folders.
 
 Use `Choose folder` to upload a local directory recursively. Each file is uploaded as its own resumable transfer and keeps its relative path under the selected folder.
 
